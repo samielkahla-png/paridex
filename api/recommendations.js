@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════
-//  PARIDEX RECOMMENDATIONS V6 — MULTI-SPORT API-SPORTS
+//  PARIDEX RECOMMENDATIONS V7 — MULTI-SPORT + FORME OBLIGATOIRE
 //  Objectif : cotes réelles + enrichissement API-Sports par sport.
 //  - Football : API-Football v3
 //  - Basket : API-Basketball v1
@@ -471,25 +471,97 @@ async function fetchGamesForDate(api, date, errors) {
   });
 }
 
-async function fetchRecentGames(api, teamId, errors) {
+function isNil(v) {
+  return v === undefined || v === null || v === '';
+}
+
+function toScoreNumber(v) {
+  if (isNil(v)) return NaN;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function statusShort(game, api) {
+  if (api === 'football') return game?.fixture?.status?.short || game?.status?.short || '';
+  return game?.status?.short || game?.status?.long || game?.status || game?.game?.status || '';
+}
+
+function isFinishedGame(game, api) {
+  const st = String(statusShort(game, api) || '').toUpperCase();
+  if (api === 'football') return ['FT', 'AET', 'PEN'].includes(st);
+  if (!st) {
+    const hs = extractScore(game, 'home', api);
+    const as = extractScore(game, 'away', api);
+    return Number.isFinite(hs) && Number.isFinite(as);
+  }
+  return ['FT', 'AET', 'PEN', 'FINISHED', 'ENDED', 'FINAL', 'FULLTIME', 'AFTER OVERTIME', 'COMPLETED'].some(x => st.includes(x));
+}
+
+function uniqGames(games, api) {
+  const out = [];
+  const seen = new Set();
+  for (const g of games || []) {
+    const id = getGameId(g) || `${getGameDate(g) || ''}:${JSON.stringify(getTeams(g, api))}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(g);
+  }
+  return out;
+}
+
+async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
   const path = api === 'football' ? '/fixtures' : '/games';
-  const key = `${api}:recent:${teamId}`;
+  const season = context.season || new Date().getUTCFullYear();
+  const league = context.leagueId;
+  const key = `${api}:recent:${teamId}:${season}:${league || 'all'}`;
+
   return cached(key, 3 * 60 * 60 * 1000, async () => {
-    const attempts = [
-      { team: teamId, last: 5 },
-      { id: teamId, last: 5 },
-    ];
-    for (const params of attempts) {
+    const attempts = api === 'football'
+      ? [
+          // Le plus fiable pour la forme football : saison + ligue + statut terminé.
+          { team: teamId, season, league, status: 'FT' },
+          { team: teamId, season, status: 'FT' },
+          { team: teamId, season, league },
+          { team: teamId, season },
+          { team: teamId, last: 12 },
+          { team: teamId, last: 25 },
+        ]
+      : [
+          { team: teamId, season, league },
+          { team: teamId, season },
+          { team: teamId, last: 12 },
+          { id: teamId, last: 12 },
+        ];
+
+    let collected = [];
+    const requestErrors = [];
+
+    for (const rawParams of attempts) {
+      const params = Object.fromEntries(Object.entries(rawParams).filter(([, v]) => !isNil(v)));
       try {
         const body = await apiSports(api, path, params);
         const arr = Array.isArray(body?.response) ? body.response : [];
-        if (arr.length) return arr;
+        collected = collected.concat(arr);
+        const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
+        if (finished.length >= 5) return finished;
       } catch (err) {
-        // Certains sports n'acceptent pas exactement les mêmes paramètres. On essaie le suivant.
+        requestErrors.push(`${JSON.stringify(params)} → ${err.message}`);
       }
     }
-    errors.push({ source: api, endpoint: path, team: teamId, message: 'Forme récente indisponible pour cette équipe.' });
+
+    const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
+    if (finished.length) return finished;
+
+    errors.push({
+      source: api,
+      endpoint: path,
+      team: teamId,
+      season,
+      league,
+      message: 'Forme récente indisponible pour cette équipe après plusieurs stratégies.',
+      debug: requestErrors.slice(0, 3),
+    });
     return [];
   });
 }
@@ -497,17 +569,17 @@ async function fetchRecentGames(api, teamId, errors) {
 function extractScore(game, side, api) {
   if (api === 'football') {
     const goals = game?.goals || {};
-    return Number(side === 'home' ? goals.home : goals.away);
+    return toScoreNumber(side === 'home' ? goals.home : goals.away);
   }
   if (api === 'nba') {
     const scores = game?.scores || {};
     const node = side === 'home' ? scores.home : (scores.visitors || scores.away);
-    return Number(node?.points ?? node?.total ?? node?.score);
+    return toScoreNumber(node?.points ?? node?.total ?? node?.score);
   }
   const scores = game?.scores || game?.score || {};
   const node = side === 'home' ? scores.home : scores.away;
   if (typeof node === 'number') return node;
-  return Number(node?.total ?? node?.points ?? node?.score ?? node?.runs ?? node?.goals);
+  return toScoreNumber(node?.total ?? node?.points ?? node?.score ?? node?.runs ?? node?.goals);
 }
 
 function resultForTeam(game, teamId, api) {
@@ -524,16 +596,23 @@ function resultForTeam(game, teamId, api) {
 }
 
 function summarizeForm(games, teamId, api) {
-  const form = [];
+  const rows = [];
   for (const g of games || []) {
+    if (!isFinishedGame(g, api)) continue;
     const r = resultForTeam(g, teamId, api);
-    if (r) form.push(r);
+    if (!r) continue;
+    rows.push({
+      result: r,
+      date: getGameDate(g) || '',
+    });
   }
-  const last = form.slice(-5);
+  rows.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const lastRows = rows.slice(-5);
+  const last = lastRows.map(x => x.result);
   const W = last.filter(x => x === 'W').length;
   const D = last.filter(x => x === 'D').length;
   const L = last.filter(x => x === 'L').length;
-  return { form: last, W, D, L, played: last.length, label: last.join('') };
+  return { form: last, W, D, L, played: last.length, label: last.length ? last.join('') : 'n/d' };
 }
 
 async function fetchFootballPrediction(fixtureId, errors) {
@@ -610,18 +689,29 @@ async function enrichSelections(selections, opts, errors) {
     let homeRecent = [];
     let awayRecent = [];
     // Petite pause pour éviter les rafales sur les plans gratuits.
+    const leagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
+    const season = best?.league?.season || best?.season || new Date(seed.commenceTime || Date.now()).getUTCFullYear();
+
     await sleep(20);
-    homeRecent = await fetchRecentGames(api, teams.home.id, errors);
+    homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId, season, fixtureId, seed });
     await sleep(20);
-    awayRecent = await fetchRecentGames(api, teams.away.id, errors);
+    awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId, season, fixtureId, seed });
 
     const homeStats = summarizeForm(homeRecent, teams.home.id, api);
     const awayStats = summarizeForm(awayRecent, teams.away.id, api);
     const prediction = api === 'football' ? await fetchFootballPrediction(fixtureId, errors) : null;
 
-    const fullEnough = (homeStats.played >= 3 && awayStats.played >= 3) || Boolean(prediction);
+    // Pour respecter le but de Paridex, un match principal doit avoir une vraie forme lisible.
+    // Une prédiction seule ne suffit plus, sinon l'interface affiche "forme n/d".
+    const fullEnough = homeStats.played >= 3 && awayStats.played >= 3;
     if (!fullEnough) {
-      errors.push({ source: api, event: seed.eventId, message: 'Match trouvé, mais forme/prédiction insuffisante.' });
+      errors.push({
+        source: api,
+        event: seed.eventId,
+        message: 'Match trouvé, mais forme insuffisante : exclu des combinés principaux.',
+        homePlayed: homeStats.played,
+        awayPlayed: awayStats.played,
+      });
       continue;
     }
 
