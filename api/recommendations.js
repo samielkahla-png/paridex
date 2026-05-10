@@ -461,9 +461,14 @@ export default async function handler(req, res) {
       .filter(Boolean);
     const sports = resolveSports(requestedSports);
 
-    const now = new Date();
-    const fromIso = now.toISOString();
-    const toIso = addDays(now, days).toISOString();
+const now = new Date();
+
+function oddsIso(date) {
+  return new Date(date).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+const fromIso = oddsIso(now);
+const toIso = oddsIso(addDays(now, days));
 
     const oddsResults = await Promise.allSettled(
       sports.map(async (sportKey) => {
