@@ -1083,10 +1083,29 @@ async function enrichSelections(selections, opts, errors) {
     if (byEvent.length >= maxApiEvents) break;
   }
 
+  // ▶ ÉCONOMIE QUOTA : on limite le nombre de matchs à enrichir en fonction du quota restant
+  //   Chaque match consomme ~3-5 requêtes (search team home + away + recent home + recent away + prediction).
+  //   On garde une marge de sécurité de 5 requêtes.
+  const reqPerMatch = 4;
+  const safetyBuffer = 5;
+  // On laisse plus de matchs si quota inconnu (1ère requête le révèlera)
+  const maxAffordable = apiSportsQuota.remaining !== null
+    ? Math.max(0, Math.floor((apiSportsQuota.remaining - safetyBuffer) / reqPerMatch))
+    : byEvent.length;
+
+  const eventsToEnrich = byEvent.slice(0, Math.min(byEvent.length, maxAffordable, maxApiEvents));
+
+  if (apiSportsQuota.remaining !== null && eventsToEnrich.length < byEvent.length) {
+    errors.push({
+      source: 'apisports',
+      message: `Quota API-Football limité (${apiSportsQuota.remaining}/${apiSportsQuota.limit || '?'}). Enrichissement limité à ${eventsToEnrich.length}/${byEvent.length} matchs. Pour plus, upgrade Pro $19/mois.`,
+    });
+  }
+
   const enrichedByEvent = new Map();
   let quotaExhausted = false;
 
-  for (const seed of byEvent) {
+  for (const seed of eventsToEnrich) {
     if (quotaExhausted) break;
 
     const api = seed.apiSport;
@@ -1120,16 +1139,16 @@ async function enrichSelections(selections, opts, errors) {
       const homeStats = homeTeam ? summarizeForm(homeRecent, homeTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
       const awayStats = awayTeam ? summarizeForm(awayRecent, awayTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
 
-      // ▶ ÉTAPE 3 : Predictions (si on a trouvé un fixtureId via les matchs prochains de l'équipe domicile)
+      // ▶ ÉTAPE 3 : Predictions (uniquement si quota OK : ça coûte 2 requêtes en plus par match)
       let prediction = null;
       let fixtureId = null;
-      if (api === 'football' && homeTeam) {
+      const quotaOkForPredictions = apiSportsQuota.remaining === null || apiSportsQuota.remaining > 20;
+      if (api === 'football' && homeTeam && quotaOkForPredictions) {
         // Cherche le prochain fixture de l'équipe domicile pour récupérer le fixtureId
         try {
           await sleep(15);
           const nextBody = await apiSports(api, '/fixtures', { team: homeTeam.id, next: 5 });
           const upcoming = Array.isArray(nextBody?.response) ? nextBody.response : [];
-          // Cherche le match contre l'équipe extérieure attendue
           const targetMatch = upcoming.find(g => {
             const t = getTeams(g, api);
             return awayTeam && String(t.away.id) === String(awayTeam.id);
