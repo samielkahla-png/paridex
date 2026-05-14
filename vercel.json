@@ -1,9 +1,11 @@
 {
   "version": 2,
   "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "/api/:path*"
+    { "source": "/api/:path*", "destination": "/api/:path*" }
+  ],
+  "functions": {
+    "api/recommendations.js": {
+      "maxDuration": 60
     }
-  ]
+  }
 }
