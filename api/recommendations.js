@@ -1075,7 +1075,23 @@ async function enrichSelections(selections, opts, errors) {
   const maxApiEvents = opts.maxApiEvents;
   const byEvent = [];
   const seen = new Set();
-  for (const s of selections.sort((a, b) => a.odd - b.odd)) {
+
+  // ▶ PRIORISATION INTELLIGENTE :
+  //   1. Foot avec ligue mappée (Ligue 1, EPL, Brazil, etc.) en premier
+  //   2. Cotes intéressantes (1.5-2.5) avant ultra-favoris (1.2) et outsiders (>3)
+  //   → maximise les chances de trouver des stats utiles avec peu de quota
+  const prioritized = selections.slice().sort((a, b) => {
+    const aIsFootMapped = a.apiSport === 'football' && ODDS_TO_APIFOOTBALL_LEAGUE[a.oddsSportKey] ? 1 : 0;
+    const bIsFootMapped = b.apiSport === 'football' && ODDS_TO_APIFOOTBALL_LEAGUE[b.oddsSportKey] ? 1 : 0;
+    if (aIsFootMapped !== bIsFootMapped) return bIsFootMapped - aIsFootMapped;
+
+    // Score "cote sweet spot" : proche de 1.7 (équilibre entre proba et value)
+    const sweetA = Math.abs(a.odd - 1.7);
+    const sweetB = Math.abs(b.odd - 1.7);
+    return sweetA - sweetB;
+  });
+
+  for (const s of prioritized) {
     if (!seen.has(s.eventId)) {
       seen.add(s.eventId);
       byEvent.push(s);
@@ -1084,8 +1100,7 @@ async function enrichSelections(selections, opts, errors) {
   }
 
   // ▶ ÉCONOMIE QUOTA : on limite le nombre de matchs à enrichir en fonction du quota restant
-  //   Chaque match consomme ~3-5 requêtes (search team home + away + recent home + recent away + prediction).
-  //   On garde une marge de sécurité de 5 requêtes.
+  //   Chaque match consomme ~3-5 requêtes.
   const reqPerMatch = 4;
   const safetyBuffer = 5;
   // On laisse plus de matchs si quota inconnu (1ère requête le révèlera)
@@ -1494,7 +1509,9 @@ export default async function handler(req, res) {
     const days = clamp(Number(q.days || 3), 1, 14);
     const limit = clamp(Number(q.limit || 20), 1, 40);
     const maxLegs = q.maxLegs ? Number(q.maxLegs) : undefined;
-    const maxApiEvents = clamp(Number(q.maxApiEvents || 60), 5, 120);
+    // ▶ Mode testOne : enrichit UN seul match pour valider le pipeline sans consommer le quota
+    const testOne = String(q.testOne || '0') === '1';
+    const maxApiEvents = testOne ? 1 : clamp(Number(q.maxApiEvents || 60), 5, 120);
     const unibetOnly = String(q.unibetOnly ?? '1') !== '0';
     const allowPartial = String(q.allowPartial || '0') === '1';
 
@@ -1593,7 +1610,8 @@ export default async function handler(req, res) {
       mode: combos.every(c => c.dataQuality === 'full') ? 'full-multisport' : 'partial',
       message: statusMessage,
       quota,
-      params: { days, risk, limit, maxLegs: legLimitForRisk(risk, maxLegs), sports: activeRequested, unibetOnly, allowPartial, maxApiEvents },
+      apiSportsQuota: { ...apiSportsQuota }, // Pour suivre la consommation côté frontend
+      params: { days, risk, limit, maxLegs: legLimitForRisk(risk, maxLegs), sports: activeRequested, unibetOnly, allowPartial, maxApiEvents, testOne },
       counts: {
         requestedSports: requestedKeys.length,
         activeSports: activeRequested.length,
