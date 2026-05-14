@@ -695,18 +695,23 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
         totalRawResponses += arr.length;
         collected = collected.concat(arr);
         const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
-        if (finished.length >= 3) return finished;
+        // ▶ ÉCONOMIE QUOTA : on s'arrête dès qu'on a 1 match terminé (suffit pour partial)
+        if (finished.length >= 1) return finished;
+        // ▶ Et aussi si l'API a renvoyé des matchs (même non terminés), on s'arrête
+        //   pour ne pas griller du quota inutile (saison en cours = beaucoup de NS)
+        if (arr.length >= 5) {
+          await sleep(150);
+          break;
+        }
       } catch (err) {
         requestErrors.push(`${JSON.stringify(params)} → ${err.message}`);
         if (err.message && err.message.includes('Quota API-Sports épuisé')) {
           throw err;
         }
-        // ▶ HTTP 429 = rate limit minute → on attend 1 seconde et on continue
         if (err.message && (err.message.includes('429') || err.message.toLowerCase().includes('too many'))) {
           await sleep(1100);
         }
       }
-      // ▶ Pause de sécurité entre tentatives pour respecter le rate-limit minute (10 req/min sur Free)
       await sleep(150);
     }
 
@@ -1614,8 +1619,53 @@ export default async function handler(req, res) {
       return true;
     });
 
-    const enrichedSelections = await enrichSelections(rawSelections, { allowPartial, maxApiEvents }, errors);
-    const combos = buildCombos(enrichedSelections, { risk, limit, maxLegs, allowPartial });
+    // ▶ STRATÉGIE EN 2 PHASES (économie quota API-Football) :
+    //   PHASE 1 : Forme les combinés sur la BASE DES COTES uniquement
+    //   PHASE 2 : Enrichit UNIQUEMENT les sélections qui sont DANS un combiné
+    //   → 6x moins de quota consommé qu'en enrichissant toutes les 200 sélections
+
+    // PHASE 1 : Construit les combinés en mode "cote seule" (gratuit, 0 req API-Football)
+    // On marque toutes les sélections en odds_only pour que buildCombos accepte tout
+    const phase1Selections = rawSelections.map(s => ({
+      ...s,
+      dataQuality: 'odds_only',
+      // Petit boost de confiance pour passer le filtre minConf
+      confidence: clamp(Math.round((s.baseProbability || (100 / s.odd)) * 0.85 + 12), 35, 75),
+    }));
+
+    // Construit plus de combinés que demandés pour avoir le choix après enrichissement
+    const phase1Combos = buildCombos(phase1Selections, { risk, limit: limit * 2, maxLegs, allowPartial: true });
+
+    // Extrait les sélections uniques DES combinés (par eventId)
+    const selectionsInCombosMap = new Map();
+    for (const combo of phase1Combos) {
+      for (const leg of combo.legs || []) {
+        if (!selectionsInCombosMap.has(leg.eventId)) {
+          selectionsInCombosMap.set(leg.eventId, leg);
+        }
+      }
+    }
+    const selectionsInCombos = Array.from(selectionsInCombosMap.values());
+
+    errors.push({
+      source: 'paridex',
+      message: `[v9] PHASE 1: ${phase1Combos.length} combinés candidats avec ${selectionsInCombos.length} matchs uniques à enrichir (vs ${rawSelections.length} sélections totales)`,
+    });
+
+    // PHASE 2 : Enrichit UNIQUEMENT ces ~30 matchs (économie 6x)
+    const enrichedSelections = await enrichSelections(selectionsInCombos, { allowPartial, maxApiEvents }, errors);
+
+    // Crée un map pour retrouver rapidement les versions enrichies
+    const enrichedMap = new Map();
+    for (const e of enrichedSelections) enrichedMap.set(e.eventId, e);
+
+    // PHASE 3 : Reconstruit les combinés avec les versions enrichies (stats + scoring affiné)
+    const finalSelections = phase1Selections.map(s => {
+      const enriched = enrichedMap.get(s.eventId);
+      return enriched ? { ...s, ...enriched } : s;
+    });
+
+    const combos = buildCombos(finalSelections, { risk, limit, maxLegs, allowPartial });
 
     const fullyEnriched = enrichedSelections.filter(s => s.dataQuality === 'full').length;
     const partial = enrichedSelections.filter(s => s.dataQuality !== 'full').length;
