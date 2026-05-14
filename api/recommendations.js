@@ -1013,7 +1013,17 @@ async function enrichSelections(selections, opts, errors) {
   for (const s of selections) {
     const e = enrichedByEvent.get(s.eventId);
     if (!e) {
-      if (opts.allowPartial) enriched.push(s);
+      // ▶ Sélection non enrichie : on la GARDE en mode odds_only
+      //   (sport unknown, match non retrouvé dans API-Sports, etc.)
+      //   La confidence reste basée sur la cote, mais on accepte de combiner ces matchs
+      //   plutôt que de retourner "0 combiné".
+      enriched.push({
+        ...s,
+        dataQuality: 'odds_only',
+        // pas de prédiction réelle → on s'appuie uniquement sur la cote
+        probability: s.baseProbability || (100 / s.odd),
+        confidence: clamp(Math.round((s.baseProbability || (100 / s.odd)) * 0.85 + 12), 35, 75),
+      });
       continue;
     }
 
@@ -1092,13 +1102,24 @@ function buildCombos(selections, opts) {
   const risk = opts.risk;
   const maxLegs = legLimitForRisk(risk, opts.maxLegs);
   const minConf = minConfidenceForRisk(risk);
-  // Accepte 'full' et 'partial' (enrichi mais avec peu de forme), uniquement 'odds_only' si allowPartial
-  const sorted = selections
-    .filter(s => s.dataQuality === 'full' || s.dataQuality === 'partial' || opts.allowPartial)
-    .filter(s => s.confidence >= minConf)
-    .sort((a, b) => (b.confidence - a.confidence) || (a.odd - b.odd));
 
-  const candidates = [];
+  // ▶ STRATÉGIE EN CASCADE INTERNE :
+  //   1. D'abord on tente avec sélections 'full' ou 'partial' (enrichies)
+  //   2. Si pas assez (< 3 sélections), on ouvre aux 'odds_only' avec confiance assouplie
+  let candidates = selections.filter(s =>
+    (s.dataQuality === 'full' || s.dataQuality === 'partial')
+    && s.confidence >= minConf
+  );
+
+  if (candidates.length < 3) {
+    // Pas assez de sélections enrichies → on accepte les odds_only avec confiance abaissée
+    const minConfRelaxed = Math.max(40, minConf - 18);
+    candidates = selections.filter(s => s.confidence >= minConfRelaxed);
+  }
+
+  const sorted = combos.sort((a, b) => (b.confidence - a.confidence) || (a.odd - b.odd));
+
+  const combos = [];
   const maxPool = Math.min(sorted.length, 80);
   const pool = sorted.slice(0, maxPool);
 
@@ -1151,7 +1172,7 @@ function buildCombos(selections, opts) {
       + marketBonus
       - extremePenalty;
 
-    candidates.push({
+    combos.push({
       legs,
       odd,
       probability,
@@ -1176,7 +1197,7 @@ function buildCombos(selections, opts) {
     }
   }
 
-  candidates.sort((a, b) => b.score - a.score);
+  combos.sort((a, b) => b.score - a.score);
 
   const selected = [];
   const eventUse = new Map();
@@ -1189,7 +1210,7 @@ function buildCombos(selections, opts) {
   }
 
   for (const maxUse of [1, 2, 3, 4]) {
-    for (const c of candidates) {
+    for (const c of combos) {
       if (selected.length >= opts.limit) break;
       if (!canTake(c, maxUse)) continue;
       const fp = c.legs.map(l => l.eventId).sort().join('|');
