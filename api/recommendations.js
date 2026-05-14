@@ -1544,6 +1544,13 @@ export default async function handler(req, res) {
     const unibetOnly = String(q.unibetOnly ?? '1') !== '0';
     const allowPartial = String(q.allowPartial || '0') === '1';
 
+    // ▶ Liste de matchs déjà proposés à l'utilisateur (historique 24h)
+    //   On les exclut pour éviter de reproposer les mêmes combinés
+    const excludeEventIdsRaw = String(q.excludeEventIds || '').trim();
+    const excludeEventIds = excludeEventIdsRaw
+      ? new Set(excludeEventIdsRaw.split(',').map(s => s.trim()).filter(Boolean))
+      : new Set();
+
     const fromIso = oddsIso(new Date());
     const toIso = oddsIso(addDays(new Date(), days));
 
@@ -1618,6 +1625,19 @@ export default async function handler(req, res) {
       seenSel.add(key);
       return true;
     });
+
+    // ▶ EXCLUSION HISTORIQUE : retire les matchs déjà proposés à l'utilisateur (24h)
+    const beforeExclude = rawSelections.length;
+    if (excludeEventIds.size > 0) {
+      rawSelections = rawSelections.filter(s => !excludeEventIds.has(s.eventId));
+      const removed = beforeExclude - rawSelections.length;
+      if (removed > 0) {
+        errors.push({
+          source: 'paridex',
+          message: `[v9] Historique : ${removed} sélections exclues (matchs déjà proposés)`,
+        });
+      }
+    }
 
     // ▶ STRATÉGIE EN 2 PHASES (économie quota API-Football) :
     //   PHASE 1 : Forme les combinés sur la BASE DES COTES uniquement
