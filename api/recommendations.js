@@ -251,20 +251,37 @@ function getApiSportsKey(api) {
   return '';
 }
 
+// État global du quota API-Sports (consommation actuelle visible)
+let apiSportsQuota = { remaining: null, used: null, limit: null };
+
 async function apiSports(api, path, params = {}) {
   const base = API_BASES[api];
   if (!base) throw new Error(`API-Sports non configurée pour ${api}`);
   const key = getApiSportsKey(api);
   if (!key) throw new Error(`Clé API-Sports manquante pour ${api}. Ajoute APISPORTS_KEY dans Vercel.`);
 
+  // ▶ COUPE-CIRCUIT : si quota < 3, on n'envoie plus de requêtes
+  if (apiSportsQuota.remaining !== null && Number(apiSportsQuota.remaining) < 3) {
+    throw new Error(`Quota API-Sports épuisé (reste ${apiSportsQuota.remaining}). Enrichissement stoppé.`);
+  }
+
   const url = new URL(base + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   }
-  const { body } = await fetchJson(url.toString(), {
+  const { body, headers } = await fetchJson(url.toString(), {
     headers: { Accept: 'application/json', 'x-apisports-key': key },
     timeoutMs: 10000,
   });
+
+  // ▶ Met à jour le quota visible
+  const remaining = headers.get('x-ratelimit-requests-remaining');
+  const used = headers.get('x-ratelimit-requests-used');
+  const limit = headers.get('x-ratelimit-requests-limit');
+  if (remaining !== null) apiSportsQuota.remaining = Number(remaining);
+  if (used !== null) apiSportsQuota.used = Number(used);
+  if (limit !== null) apiSportsQuota.limit = Number(limit);
+
   return body;
 }
 
@@ -595,21 +612,15 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
   const key = `${api}:recent:${teamId}:${season}:${league || 'all'}`;
 
   return cached(key, 3 * 60 * 60 * 1000, async () => {
+    // ▶ ÉCONOMIE QUOTA : 1-2 tentatives maximum au lieu de 5
+    //   Avec 100 req/jour sur le plan Free, on doit éviter les rafales.
     const attempts = api === 'football'
       ? [
-          // Le plus fiable pour la forme football : saison + ligue + statut terminé.
-          { team: teamId, season, league, status: 'FT' },
-          { team: teamId, season, status: 'FT' },
-          { team: teamId, season, league },
-          { team: teamId, season },
+          // Stratégie la plus large : last=12 capture les 12 derniers matchs toutes compétitions
           { team: teamId, last: 12 },
-          { team: teamId, last: 25 },
         ]
       : [
-          { team: teamId, season, league },
-          { team: teamId, season },
           { team: teamId, last: 12 },
-          { id: teamId, last: 12 },
         ];
 
     let collected = [];
@@ -622,9 +633,14 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
         const arr = Array.isArray(body?.response) ? body.response : [];
         collected = collected.concat(arr);
         const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
-        if (finished.length >= 5) return finished;
+        // On accepte dès qu'on a 3 matchs (pas 5)
+        if (finished.length >= 3) return finished;
       } catch (err) {
         requestErrors.push(`${JSON.stringify(params)} → ${err.message}`);
+        // Si l'erreur est un quota épuisé, on arrête tout immédiatement
+        if (err.message && err.message.includes('Quota API-Sports épuisé')) {
+          throw err;
+        }
       }
     }
 
@@ -637,8 +653,8 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
       team: teamId,
       season,
       league,
-      message: 'Forme récente indisponible pour cette équipe après plusieurs stratégies.',
-      debug: requestErrors.slice(0, 3),
+      message: 'Forme récente indisponible pour cette équipe.',
+      debug: requestErrors.slice(0, 2),
     });
     return [];
   });
@@ -940,73 +956,91 @@ async function enrichSelections(selections, opts, errors) {
   }
 
   const enrichedByEvent = new Map();
+  let quotaExhausted = false;
 
   for (const seed of byEvent) {
+    // Si le quota est épuisé, on stoppe tout (les sélections restantes resteront en odds_only)
+    if (quotaExhausted) break;
+
     const api = seed.apiSport;
     if (!API_BASES[api] || api === 'mma' || api === 'formula1') {
       errors.push({ source: api, event: seed.eventId, message: `Enrichissement automatique non activé pour ${api}.` });
       continue;
     }
 
-    const date = dateOnly(seed.commenceTime || new Date());
-    const games = await fetchGamesForDate(api, date, errors);
-    let best = null;
-    let bestScore = 0;
-    for (const g of games) {
-      const sc = scoreMatch(seed, g);
-      if (sc > bestScore) { best = g; bestScore = sc; }
-    }
-    if (!best || bestScore < 0.72) {
-      errors.push({ source: api, event: seed.eventId, message: `Match non retrouvé dans API-Sports (${api})`, score: Number(bestScore.toFixed(2)) });
-      continue;
-    }
+    try {
+      const date = dateOnly(seed.commenceTime || new Date());
+      const games = await fetchGamesForDate(api, date, errors);
+      let best = null;
+      let bestScore = 0;
+      for (const g of games) {
+        const sc = scoreMatch(seed, g);
+        if (sc > bestScore) { best = g; bestScore = sc; }
+      }
+      if (!best || bestScore < 0.72) {
+        errors.push({ source: api, event: seed.eventId, message: `Match non retrouvé dans API-Sports (${api})`, score: Number(bestScore.toFixed(2)) });
+        continue;
+      }
 
-    const teams = getTeams(best, api);
-    const fixtureId = getGameId(best);
-    const leagueName = getLeagueName(best, seed.league);
+      const teams = getTeams(best, api);
+      const fixtureId = getGameId(best);
+      const leagueName = getLeagueName(best, seed.league);
 
-    let homeRecent = [];
-    let awayRecent = [];
-    // Petite pause pour éviter les rafales sur les plans gratuits.
-    const leagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
-    const season = best?.league?.season || best?.season || new Date(seed.commenceTime || Date.now()).getUTCFullYear();
+      let homeRecent = [];
+      let awayRecent = [];
+      const leagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
 
-    await sleep(20);
-    homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId, season, fixtureId, seed });
-    await sleep(20);
-    awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId, season, fixtureId, seed });
+      const matchDate = new Date(seed.commenceTime || Date.now());
+      const month = matchDate.getUTCMonth() + 1;
+      const year = matchDate.getUTCFullYear();
+      const guessedSeason = (api === 'football' && month <= 7) ? year - 1 : year;
+      const season = best?.league?.season || best?.season || guessedSeason;
 
-    const homeStats = summarizeForm(homeRecent, teams.home.id, api);
-    const awayStats = summarizeForm(awayRecent, teams.away.id, api);
-    const prediction = api === 'football' ? await fetchFootballPrediction(fixtureId, errors) : null;
+      await sleep(20);
+      homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId, season, fixtureId, seed });
+      await sleep(20);
+      awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId, season, fixtureId, seed });
 
-    // ▶ Critère assoupli : on accepte tout match retrouvé.
-    //    Si la forme est faible (< 3 matchs joués), on marque dataQuality='partial'
-    //    et le scoring le sait. Mieux que rejeter totalement.
-    const fullEnough = homeStats.played >= 3 && awayStats.played >= 3;
-    const partialEnough = homeStats.played >= 1 || awayStats.played >= 1 || prediction;
+      const homeStats = summarizeForm(homeRecent, teams.home.id, api);
+      const awayStats = summarizeForm(awayRecent, teams.away.id, api);
+      const prediction = api === 'football' ? await fetchFootballPrediction(fixtureId, errors) : null;
 
-    if (!fullEnough && !partialEnough) {
-      errors.push({
-        source: api,
-        event: seed.eventId,
-        message: 'Match trouvé, mais aucune donnée exploitable (0 forme, 0 prediction).',
-        homePlayed: homeStats.played,
-        awayPlayed: awayStats.played,
+      const fullEnough = homeStats.played >= 3 && awayStats.played >= 3;
+      const partialEnough = homeStats.played >= 1 || awayStats.played >= 1 || prediction;
+
+      if (!fullEnough && !partialEnough) {
+        errors.push({
+          source: api,
+          event: seed.eventId,
+          message: 'Match trouvé, mais aucune donnée exploitable (0 forme, 0 prediction).',
+          homePlayed: homeStats.played,
+          awayPlayed: awayStats.played,
+        });
+        continue;
+      }
+
+      enrichedByEvent.set(seed.eventId, {
+        api,
+        fixtureId,
+        leagueName,
+        teams,
+        homeStats,
+        awayStats,
+        prediction,
+        _quality: fullEnough ? 'full' : 'partial',
       });
-      continue;
+    } catch (err) {
+      if (err.message && err.message.includes('Quota API-Sports épuisé')) {
+        quotaExhausted = true;
+        errors.push({
+          source: 'apisports',
+          message: `🛑 Quota API-Sports épuisé. ${enrichedByEvent.size} matchs enrichis, ${byEvent.length - enrichedByEvent.size - 1} restants traités en cotes seules.`,
+          quota: apiSportsQuota,
+        });
+      } else {
+        errors.push({ source: api, event: seed.eventId, message: err.message });
+      }
     }
-
-    enrichedByEvent.set(seed.eventId, {
-      api,
-      fixtureId,
-      leagueName,
-      teams,
-      homeStats,
-      awayStats,
-      prediction,
-      _quality: fullEnough ? 'full' : 'partial',
-    });
   }
 
   const enriched = [];
