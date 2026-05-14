@@ -1432,6 +1432,40 @@ export default async function handler(req, res) {
   const started = Date.now();
   const errors = [];
 
+  // ▶ MODE DEBUG : permet de tester la recherche d'équipe en isolation
+  //   Ex: /api/recommendations?debug=teamSearch&team=Palmeiras
+  //   Renvoie ce qu'API-Sports répond + similarités calculées
+  if (req.query?.debug === 'teamSearch') {
+    const teamName = String(req.query.team || '').trim();
+    const api = String(req.query.api || 'football').toLowerCase();
+    if (!teamName) return sendJson(res, 400, { ok: false, error: 'MISSING_TEAM', message: 'Ajoute ?team=NomEquipe' });
+    try {
+      const body = await apiSports(api, '/teams', { search: teamName.substring(0, 30) });
+      const arr = Array.isArray(body?.response) ? body.response : [];
+      const matches = arr.map(entry => {
+        const t = entry.team || entry;
+        return {
+          id: t.id,
+          name: t.name,
+          country: t.country,
+          similarity: Number(similarity(teamName, t.name || '').toFixed(2)),
+          accepted: similarity(teamName, t.name || '') >= 0.55,
+        };
+      });
+      return sendJson(res, 200, {
+        ok: true,
+        teamName,
+        api,
+        resultsCount: arr.length,
+        matches: matches.sort((a, b) => b.similarity - a.similarity).slice(0, 10),
+        quota: apiSportsQuota,
+        errors,
+      });
+    } catch (err) {
+      return sendJson(res, 500, { ok: false, error: err.message, teamName, api });
+    }
+  }
+
   try {
     const oddsKey = process.env.ODDS_API_KEY;
     if (!oddsKey) return sendJson(res, 500, { ok: false, error: 'MISSING_ODDS_API_KEY', message: 'Ajoute ODDS_API_KEY dans Vercel.' });
