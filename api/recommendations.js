@@ -998,6 +998,43 @@ function adviceText(selection, match, homeStats, awayStats, prediction) {
   return base;
 }
 
+// ▶ NOUVELLE STRATEGIE : team-first
+//   Au lieu de chercher fixtures par date+league+season (qui échoue car saisons varient),
+//   on cherche les ÉQUIPES par leur nom, puis on récupère leurs derniers matchs.
+//   Plus fiable car indépendant des dates et saisons.
+async function searchTeamByName(api, teamName, errors) {
+  if (!teamName) return null;
+  const key = `${api}:teamSearch:${teamName.toLowerCase()}`;
+  return cached(key, 7 * 24 * 60 * 60 * 1000, async () => { // cache 7 jours
+    try {
+      // API-Football : /teams?search=Palmeiras (min 3 caractères)
+      const search = teamName.length >= 3 ? teamName.substring(0, 30) : teamName;
+      const body = await apiSports(api, '/teams', { search });
+      const arr = Array.isArray(body?.response) ? body.response : [];
+      if (arr.length === 0) return null;
+
+      // Trouve la meilleure correspondance par similarité de nom
+      let best = null;
+      let bestSim = 0;
+      for (const entry of arr) {
+        const teamData = entry.team || entry;
+        const apiName = teamData.name || '';
+        const sim = similarity(teamName, apiName);
+        if (sim > bestSim) {
+          bestSim = sim;
+          best = { id: teamData.id, name: apiName, similarity: sim };
+        }
+      }
+      if (best && best.similarity >= 0.7) return best;
+      return null;
+    } catch (err) {
+      errors.push({ source: api, message: `Recherche équipe "${teamName}" échouée : ${err.message}` });
+      if (err.message && err.message.includes('Quota')) throw err;
+      return null;
+    }
+  });
+}
+
 async function enrichSelections(selections, opts, errors) {
   const maxApiEvents = opts.maxApiEvents;
   const byEvent = [];
@@ -1014,7 +1051,6 @@ async function enrichSelections(selections, opts, errors) {
   let quotaExhausted = false;
 
   for (const seed of byEvent) {
-    // Si le quota est épuisé, on stoppe tout (les sélections restantes resteront en odds_only)
     if (quotaExhausted) break;
 
     const api = seed.apiSport;
@@ -1024,53 +1060,53 @@ async function enrichSelections(selections, opts, errors) {
     }
 
     try {
-      const date = dateOnly(seed.commenceTime || new Date());
+      // ▶ ÉTAPE 1 : Trouver les IDs des 2 équipes par recherche de nom
+      await sleep(15);
+      const homeTeam = await searchTeamByName(api, seed.homeTeam, errors);
+      await sleep(15);
+      const awayTeam = await searchTeamByName(api, seed.awayTeam, errors);
 
-      // ▶ Cible la ligue API-Football pour avoir TOUS les matchs de cette ligue ce jour
-      //   On essaie 2 saisons (année courante et année précédente) pour couvrir
-      //   à la fois les championnats au calendrier européen (sept→mai) et civil (jan→déc).
-      const year = new Date(seed.commenceTime || Date.now()).getUTCFullYear();
-      const leagueId = api === 'football' ? ODDS_TO_APIFOOTBALL_LEAGUE[seed.oddsSportKey] : null;
-      const games = await fetchGamesForDate(api, date, errors, {
-        league: leagueId,
-        seasons: leagueId ? [year, year - 1] : [],
-      });
-      let best = null;
-      let bestScore = 0;
-      for (const g of games) {
-        const sc = scoreMatch(seed, g);
-        if (sc > bestScore) { best = g; bestScore = sc; }
-      }
-      if (!best || bestScore < 0.72) {
+      if (!homeTeam && !awayTeam) {
         errors.push({
           source: api,
           event: seed.eventId,
-          message: `Match non retrouvé dans API-Sports (${api})`,
-          score: Number(bestScore.toFixed(2)),
-          leagueId,
-          gamesFound: games.length,
+          message: `Équipes non trouvées dans API-Sports : "${seed.homeTeam}" et "${seed.awayTeam}"`,
         });
         continue;
       }
 
-      const teams = getTeams(best, api);
-      const fixtureId = getGameId(best);
-      const leagueName = getLeagueName(best, seed.league);
-
-      let homeRecent = [];
-      let awayRecent = [];
-      const apiSportsLeagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
-      // La saison vient toujours de l'API (best.league.season), donc plus de devinette nécessaire
-      const season = best?.league?.season || best?.season || new Date(seed.commenceTime || Date.now()).getUTCFullYear();
-
+      // ▶ ÉTAPE 2 : Récupérer la forme (last=10) pour chaque équipe — pas de saison nécessaire
       await sleep(20);
-      homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId: apiSportsLeagueId, season, fixtureId, seed });
+      const homeRecent = homeTeam ? await fetchRecentGames(api, homeTeam.id, errors, { fixtureId: null, seed }) : [];
       await sleep(20);
-      awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId: apiSportsLeagueId, season, fixtureId, seed });
+      const awayRecent = awayTeam ? await fetchRecentGames(api, awayTeam.id, errors, { fixtureId: null, seed }) : [];
 
-      const homeStats = summarizeForm(homeRecent, teams.home.id, api);
-      const awayStats = summarizeForm(awayRecent, teams.away.id, api);
-      const prediction = api === 'football' ? await fetchFootballPrediction(fixtureId, errors) : null;
+      const homeStats = homeTeam ? summarizeForm(homeRecent, homeTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
+      const awayStats = awayTeam ? summarizeForm(awayRecent, awayTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
+
+      // ▶ ÉTAPE 3 : Predictions (si on a trouvé un fixtureId via les matchs prochains de l'équipe domicile)
+      let prediction = null;
+      let fixtureId = null;
+      if (api === 'football' && homeTeam) {
+        // Cherche le prochain fixture de l'équipe domicile pour récupérer le fixtureId
+        try {
+          await sleep(15);
+          const nextBody = await apiSports(api, '/fixtures', { team: homeTeam.id, next: 5 });
+          const upcoming = Array.isArray(nextBody?.response) ? nextBody.response : [];
+          // Cherche le match contre l'équipe extérieure attendue
+          const targetMatch = upcoming.find(g => {
+            const t = getTeams(g, api);
+            return awayTeam && String(t.away.id) === String(awayTeam.id);
+          });
+          if (targetMatch) {
+            fixtureId = getGameId(targetMatch);
+            await sleep(15);
+            prediction = await fetchFootballPrediction(fixtureId, errors);
+          }
+        } catch (err) {
+          if (err.message && err.message.includes('Quota')) throw err;
+        }
+      }
 
       const fullEnough = homeStats.played >= 3 && awayStats.played >= 3;
       const partialEnough = homeStats.played >= 1 || awayStats.played >= 1 || prediction;
@@ -1079,9 +1115,11 @@ async function enrichSelections(selections, opts, errors) {
         errors.push({
           source: api,
           event: seed.eventId,
-          message: 'Match trouvé, mais aucune donnée exploitable (0 forme, 0 prediction).',
+          message: 'Équipes trouvées mais aucun match récent exploitable.',
           homePlayed: homeStats.played,
           awayPlayed: awayStats.played,
+          homeId: homeTeam?.id,
+          awayId: awayTeam?.id,
         });
         continue;
       }
@@ -1089,8 +1127,11 @@ async function enrichSelections(selections, opts, errors) {
       enrichedByEvent.set(seed.eventId, {
         api,
         fixtureId,
-        leagueName,
-        teams,
+        leagueName: seed.league,
+        teams: {
+          home: { id: homeTeam?.id, name: homeTeam?.name || seed.homeTeam },
+          away: { id: awayTeam?.id, name: awayTeam?.name || seed.awayTeam },
+        },
         homeStats,
         awayStats,
         prediction,
