@@ -667,18 +667,12 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
   const key = `${api}:recent:${teamId}:${season}:${league || 'all'}`;
 
   return cached(key, 3 * 60 * 60 * 1000, async () => {
-    // ▶ ÉCONOMIE QUOTA : 1-2 tentatives maximum au lieu de 5
-    //   Avec 100 req/jour sur le plan Free, on doit éviter les rafales.
     const attempts = api === 'football'
-      ? [
-          // Stratégie la plus large : last=12 capture les 12 derniers matchs toutes compétitions
-          { team: teamId, last: 12 },
-        ]
-      : [
-          { team: teamId, last: 12 },
-        ];
+      ? [{ team: teamId, last: 12 }]
+      : [{ team: teamId, last: 12 }];
 
     let collected = [];
+    let totalRawResponses = 0;
     const requestErrors = [];
 
     for (const rawParams of attempts) {
@@ -686,13 +680,12 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
       try {
         const body = await apiSports(api, path, params);
         const arr = Array.isArray(body?.response) ? body.response : [];
+        totalRawResponses += arr.length;
         collected = collected.concat(arr);
         const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
-        // On accepte dès qu'on a 3 matchs (pas 5)
         if (finished.length >= 3) return finished;
       } catch (err) {
         requestErrors.push(`${JSON.stringify(params)} → ${err.message}`);
-        // Si l'erreur est un quota épuisé, on arrête tout immédiatement
         if (err.message && err.message.includes('Quota API-Sports épuisé')) {
           throw err;
         }
@@ -702,13 +695,15 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
     const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
     if (finished.length) return finished;
 
+    // ▶ Diagnostic clair de ce qui s'est passé
+    const statusesSample = collected.slice(0, 3).map(g => statusShort(g, api) || 'unknown').join(', ');
     errors.push({
       source: api,
       endpoint: path,
       team: teamId,
       season,
       league,
-      message: 'Forme récente indisponible pour cette équipe.',
+      message: `[v8.1] Forme récente indisponible. API a renvoyé ${totalRawResponses} matchs bruts, 0 terminés (status échantillon: ${statusesSample || 'aucun'}).`,
       debug: requestErrors.slice(0, 2),
     });
     return [];
