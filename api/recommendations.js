@@ -980,14 +980,17 @@ async function enrichSelections(selections, opts, errors) {
     const awayStats = summarizeForm(awayRecent, teams.away.id, api);
     const prediction = api === 'football' ? await fetchFootballPrediction(fixtureId, errors) : null;
 
-    // Pour respecter le but de Paridex, un match principal doit avoir une vraie forme lisible.
-    // Une prédiction seule ne suffit plus, sinon l'interface affiche "forme n/d".
+    // ▶ Critère assoupli : on accepte tout match retrouvé.
+    //    Si la forme est faible (< 3 matchs joués), on marque dataQuality='partial'
+    //    et le scoring le sait. Mieux que rejeter totalement.
     const fullEnough = homeStats.played >= 3 && awayStats.played >= 3;
-    if (!fullEnough) {
+    const partialEnough = homeStats.played >= 1 || awayStats.played >= 1 || prediction;
+
+    if (!fullEnough && !partialEnough) {
       errors.push({
         source: api,
         event: seed.eventId,
-        message: 'Match trouvé, mais forme insuffisante : exclu des combinés principaux.',
+        message: 'Match trouvé, mais aucune donnée exploitable (0 forme, 0 prediction).',
         homePlayed: homeStats.played,
         awayPlayed: awayStats.played,
       });
@@ -1002,6 +1005,7 @@ async function enrichSelections(selections, opts, errors) {
       homeStats,
       awayStats,
       prediction,
+      _quality: fullEnough ? 'full' : 'partial',
     });
   }
 
@@ -1050,7 +1054,7 @@ async function enrichSelections(selections, opts, errors) {
       predictiveProb: pred.predictiveProb,
       edge: pred.edge,
       valueBet: pred.valueBet,
-      dataQuality: 'full',
+      dataQuality: e._quality || 'full',
       apiSports: apiPayload,
       apiFootball: apiPayload,
       _homeStats: e.homeStats,
@@ -1088,8 +1092,9 @@ function buildCombos(selections, opts) {
   const risk = opts.risk;
   const maxLegs = legLimitForRisk(risk, opts.maxLegs);
   const minConf = minConfidenceForRisk(risk);
+  // Accepte 'full' et 'partial' (enrichi mais avec peu de forme), uniquement 'odds_only' si allowPartial
   const sorted = selections
-    .filter(s => s.dataQuality === 'full' || opts.allowPartial)
+    .filter(s => s.dataQuality === 'full' || s.dataQuality === 'partial' || opts.allowPartial)
     .filter(s => s.confidence >= minConf)
     .sort((a, b) => (b.confidence - a.confidence) || (a.odd - b.odd));
 
@@ -1207,10 +1212,14 @@ function buildCombos(selections, opts) {
       totalEdge: Number(c.totalEdge.toFixed(1)),
       avgConf: Number(c.avgConf.toFixed(1)),
       minConfLeg: c.minConfLeg,
-      dataQuality: c.legs.every(l => l.dataQuality === 'full') ? 'full' : 'partial',
-      mode: c.legs.every(l => l.dataQuality === 'full') ? 'enriched' : 'partial',
+      dataQuality: c.legs.every(l => l.dataQuality === 'full') ? 'full' : (c.legs.every(l => l.dataQuality !== 'odds_only') ? 'partial' : 'odds_only'),
+      mode: c.legs.every(l => l.dataQuality === 'full') ? 'enriched' : (c.legs.every(l => l.dataQuality !== 'odds_only') ? 'partial' : 'odds_only'),
       legs: c.legs,
-      verdict: c.legs.every(l => l.dataQuality === 'full') ? `✅ Cotes + API-Sports${valueLabel}` : `ℹ️ Combiné partiel${valueLabel}`,
+      verdict: c.legs.every(l => l.dataQuality === 'full')
+        ? `✅ Cotes + API-Sports complet${valueLabel}`
+        : (c.legs.every(l => l.dataQuality !== 'odds_only')
+          ? `🔵 Cotes + forme partielle${valueLabel}`
+          : `ℹ️ Cotes seules${valueLabel}`),
       reason: c.legs.map(l => `${l.sport} ${l.league} : ${l.pick} @${l.odd.toFixed(2)}${l.valueBet ? ' 💎' : ''}`).join(' · '),
     };
   });
