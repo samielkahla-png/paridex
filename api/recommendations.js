@@ -578,22 +578,46 @@ function scoreMatch(selection, game) {
 async function fetchGamesForDate(api, date, errors, opts = {}) {
   const path = api === 'football' ? '/fixtures' : '/games';
   const leaguePart = opts.league ? `:${opts.league}` : '';
-  const seasonPart = opts.season ? `:${opts.season}` : '';
-  const key = `${api}:${path}:${date}${leaguePart}${seasonPart}`;
+  const seasonsPart = (opts.seasons || []).join(',');
+  const key = `${api}:${path}:${date}${leaguePart}:${seasonsPart}`;
   return cached(key, 30 * 60 * 1000, async () => {
-    try {
-      const params = { date };
-      // ▶ Si on connaît la ligue + saison, on filtre côté API.
-      //   Sans ça, API-Football renvoie max 100 fixtures du monde entier,
-      //   et les ligues qu'on cherche peuvent être absentes.
-      if (opts.league) params.league = opts.league;
-      if (opts.season) params.season = opts.season;
-      const body = await apiSports(api, path, params);
-      return Array.isArray(body?.response) ? body.response : [];
-    } catch (err) {
-      errors.push({ source: api, endpoint: path, date, league: opts.league, season: opts.season, message: err.message, status: err.statusCode || 500 });
-      return [];
+    // ▶ API-Football exige `season` quand on passe `league`.
+    //   Mais les championnats ont des calendriers différents :
+    //   - Europe (Ligue 1, EPL, Serie A...) : saison = année - 1 entre janvier-juillet
+    //   - Brésil/Argentine/MLS : saison = année courante (calendrier civil)
+    //   → On essaie LES DEUX saisons (N et N-1) et on fusionne.
+    const seasons = opts.seasons || [];
+    const results = [];
+
+    for (const season of seasons) {
+      try {
+        const params = { date };
+        if (opts.league) params.league = opts.league;
+        if (season) params.season = season;
+        const body = await apiSports(api, path, params);
+        const arr = Array.isArray(body?.response) ? body.response : [];
+        results.push(...arr);
+        // Si on a trouvé des matchs avec cette saison, on s'arrête (économie de quota)
+        if (arr.length > 0) break;
+      } catch (err) {
+        errors.push({ source: api, endpoint: path, date, league: opts.league, season, message: err.message, status: err.statusCode || 500 });
+        // Si erreur quota, on arrête immédiatement
+        if (err.message && err.message.includes('Quota')) break;
+      }
     }
+
+    // Fallback sans league/season (max 100 matchs monde) si rien trouvé
+    if (results.length === 0 && opts.league) {
+      try {
+        const body = await apiSports(api, path, { date });
+        const arr = Array.isArray(body?.response) ? body.response : [];
+        results.push(...arr);
+      } catch (err) {
+        // déjà loggé
+      }
+    }
+
+    return results;
   });
 }
 
@@ -1003,12 +1027,13 @@ async function enrichSelections(selections, opts, errors) {
       const date = dateOnly(seed.commenceTime || new Date());
 
       // ▶ Cible la ligue API-Football pour avoir TOUS les matchs de cette ligue ce jour
-      //   league + date suffit (pas besoin de season qui varie par championnat).
-      //   Sans ça, /fixtures?date=X retourne max 100 matchs random du monde entier.
+      //   On essaie 2 saisons (année courante et année précédente) pour couvrir
+      //   à la fois les championnats au calendrier européen (sept→mai) et civil (jan→déc).
+      const year = new Date(seed.commenceTime || Date.now()).getUTCFullYear();
       const leagueId = api === 'football' ? ODDS_TO_APIFOOTBALL_LEAGUE[seed.oddsSportKey] : null;
       const games = await fetchGamesForDate(api, date, errors, {
         league: leagueId,
-        // PAS de season ici : chaque championnat a son propre calendrier (européen vs sud-américain vs MLS)
+        seasons: leagueId ? [year, year - 1] : [],
       });
       let best = null;
       let bestScore = 0;
