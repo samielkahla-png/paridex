@@ -662,18 +662,30 @@ function uniqGames(games, api) {
 async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
   const path = api === 'football' ? '/fixtures' : '/games';
-  const season = context.season || new Date().getUTCFullYear();
+  const currentYear = new Date().getUTCFullYear();
+  // ▶ FIX : pour les calendriers européens en mai, la saison en cours est N-1
+  //   On essaie les 2 saisons pour couvrir tous les championnats.
+  const seasonsToTry = api === 'football' ? [currentYear, currentYear - 1] : [currentYear];
   const league = context.leagueId;
-  const key = `${api}:recent:${teamId}:${season}:${league || 'all'}`;
+  const key = `${api}:recent:${teamId}:multi:${league || 'all'}`;
 
   return cached(key, 3 * 60 * 60 * 1000, async () => {
-    const attempts = api === 'football'
-      ? [{ team: teamId, last: 12 }]
-      : [{ team: teamId, last: 12 }];
-
     let collected = [];
     let totalRawResponses = 0;
     const requestErrors = [];
+
+    // ▶ Stratégie cascade pour le foot : season+team (le plus fiable) → puis last seul
+    const attempts = api === 'football'
+      ? [
+          // Tente d'abord avec season (le plus fiable selon doc API-Football)
+          ...seasonsToTry.map(season => ({ team: teamId, season })),
+          // Fallback sans season
+          { team: teamId, last: 15 },
+        ]
+      : [
+          { team: teamId, season: currentYear },
+          { team: teamId, last: 15 },
+        ];
 
     for (const rawParams of attempts) {
       const params = Object.fromEntries(Object.entries(rawParams).filter(([, v]) => !isNil(v)));
@@ -689,22 +701,26 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
         if (err.message && err.message.includes('Quota API-Sports épuisé')) {
           throw err;
         }
+        // ▶ HTTP 429 = rate limit minute → on attend 1 seconde et on continue
+        if (err.message && (err.message.includes('429') || err.message.toLowerCase().includes('too many'))) {
+          await sleep(1100);
+        }
       }
+      // ▶ Pause de sécurité entre tentatives pour respecter le rate-limit minute (10 req/min sur Free)
+      await sleep(150);
     }
 
     const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
     if (finished.length) return finished;
 
-    // ▶ Diagnostic clair de ce qui s'est passé
     const statusesSample = collected.slice(0, 3).map(g => statusShort(g, api) || 'unknown').join(', ');
     errors.push({
       source: api,
       endpoint: path,
       team: teamId,
-      season,
-      league,
-      message: `[v8.1] Forme récente indisponible. API a renvoyé ${totalRawResponses} matchs bruts, 0 terminés (status échantillon: ${statusesSample || 'aucun'}).`,
-      debug: requestErrors.slice(0, 2),
+      seasonsTried: seasonsToTry,
+      message: `[v8.2] Forme indisponible. API a renvoyé ${totalRawResponses} matchs bruts, 0 terminés (status: ${statusesSample || 'aucun'}).`,
+      debug: requestErrors.slice(0, 3),
     });
     return [];
   });
@@ -1137,11 +1153,12 @@ async function enrichSelections(selections, opts, errors) {
     }
 
     try {
-      errors.push({ source: 'paridex', message: `[v8.1] Tentative enrichissement: ${seed.homeTeam} vs ${seed.awayTeam} (${api})` });
+      errors.push({ source: 'paridex', message: `[v8.2] Tentative enrichissement: ${seed.homeTeam} vs ${seed.awayTeam} (${api})` });
       // ▶ ÉTAPE 1 : Trouver les IDs des 2 équipes par recherche de nom
-      await sleep(15);
+      //   PAUSES de 200ms entre requêtes pour respecter rate limit Free (10 req/min)
+      await sleep(200);
       const homeTeam = await searchTeamByName(api, seed.homeTeam, errors);
-      await sleep(15);
+      await sleep(200);
       const awayTeam = await searchTeamByName(api, seed.awayTeam, errors);
 
       if (!homeTeam && !awayTeam) {
@@ -1154,9 +1171,9 @@ async function enrichSelections(selections, opts, errors) {
       }
 
       // ▶ ÉTAPE 2 : Récupérer la forme (last=10) pour chaque équipe — pas de saison nécessaire
-      await sleep(20);
+      await sleep(250);
       const homeRecent = homeTeam ? await fetchRecentGames(api, homeTeam.id, errors, { fixtureId: null, seed }) : [];
-      await sleep(20);
+      await sleep(250);
       const awayRecent = awayTeam ? await fetchRecentGames(api, awayTeam.id, errors, { fixtureId: null, seed }) : [];
 
       const homeStats = homeTeam ? summarizeForm(homeRecent, homeTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
@@ -1167,9 +1184,8 @@ async function enrichSelections(selections, opts, errors) {
       let fixtureId = null;
       const quotaOkForPredictions = apiSportsQuota.remaining === null || apiSportsQuota.remaining > 20;
       if (api === 'football' && homeTeam && quotaOkForPredictions) {
-        // Cherche le prochain fixture de l'équipe domicile pour récupérer le fixtureId
         try {
-          await sleep(15);
+          await sleep(250);
           const nextBody = await apiSports(api, '/fixtures', { team: homeTeam.id, next: 5 });
           const upcoming = Array.isArray(nextBody?.response) ? nextBody.response : [];
           const targetMatch = upcoming.find(g => {
