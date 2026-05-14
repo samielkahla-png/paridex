@@ -116,6 +116,29 @@ const SPORT_META = {
   motor_sport_formula_1: ['🏎️', 'formula1', 'Formule 1'],
 };
 
+// ▶ Mapping ID de ligue API-Football par clé Odds API (football uniquement)
+//   Indispensable pour cibler les bons fixtures et économiser le quota.
+//   IDs trouvés sur https://dashboard.api-football.com/soccer/ids
+const ODDS_TO_APIFOOTBALL_LEAGUE = {
+  soccer_france_ligue_one: 61,
+  soccer_france_ligue_two: 62,
+  soccer_epl: 39,
+  soccer_efl_champ: 40,
+  soccer_spain_la_liga: 140,
+  soccer_italy_serie_a: 135,
+  soccer_germany_bundesliga: 78,
+  soccer_uefa_champs_league: 2,
+  soccer_uefa_europa_league: 3,
+  soccer_uefa_europa_conference_league: 848,
+  soccer_netherlands_eredivisie: 88,
+  soccer_portugal_primeira_liga: 94,
+  soccer_turkey_super_league: 203,
+  soccer_belgium_first_div: 144,
+  soccer_brazil_campeonato: 71,
+  soccer_argentina_primera_division: 128,
+  soccer_usa_mls: 253,
+};
+
 const UNIBET_KEYS = ['unibet', 'unibet_fr', 'unibet_eu', 'unibet_uk'];
 const FALLBACK_BOOKMAKERS = ['betclic', 'betclic_fr', 'winamax', 'winamax_fr', 'pinnacle', 'bet365', 'williamhill', 'betfair', 'betfair_ex_eu'];
 
@@ -552,15 +575,23 @@ function scoreMatch(selection, game) {
   return Math.max(direct, reversed) + dateScore;
 }
 
-async function fetchGamesForDate(api, date, errors) {
+async function fetchGamesForDate(api, date, errors, opts = {}) {
   const path = api === 'football' ? '/fixtures' : '/games';
-  const key = `${api}:${path}:${date}`;
+  const leaguePart = opts.league ? `:${opts.league}` : '';
+  const seasonPart = opts.season ? `:${opts.season}` : '';
+  const key = `${api}:${path}:${date}${leaguePart}${seasonPart}`;
   return cached(key, 30 * 60 * 1000, async () => {
     try {
-      const body = await apiSports(api, path, { date });
+      const params = { date };
+      // ▶ Si on connaît la ligue + saison, on filtre côté API.
+      //   Sans ça, API-Football renvoie max 100 fixtures du monde entier,
+      //   et les ligues qu'on cherche peuvent être absentes.
+      if (opts.league) params.league = opts.league;
+      if (opts.season) params.season = opts.season;
+      const body = await apiSports(api, path, params);
       return Array.isArray(body?.response) ? body.response : [];
     } catch (err) {
-      errors.push({ source: api, endpoint: path, date, message: err.message, status: err.statusCode || 500 });
+      errors.push({ source: api, endpoint: path, date, league: opts.league, season: opts.season, message: err.message, status: err.statusCode || 500 });
       return [];
     }
   });
@@ -970,7 +1001,20 @@ async function enrichSelections(selections, opts, errors) {
 
     try {
       const date = dateOnly(seed.commenceTime || new Date());
-      const games = await fetchGamesForDate(api, date, errors);
+
+      // ▶ Cible la ligue + saison pour économiser le quota et avoir TOUS les matchs
+      //   Sans ça, /fixtures?date=X retourne max 100 matchs random du monde entier.
+      const matchDate = new Date(seed.commenceTime || Date.now());
+      const month = matchDate.getUTCMonth() + 1;
+      const year = matchDate.getUTCFullYear();
+      // Foot européen entre janvier et juillet = saison N-1
+      const guessedSeason = (api === 'football' && month <= 7) ? year - 1 : year;
+
+      const leagueId = api === 'football' ? ODDS_TO_APIFOOTBALL_LEAGUE[seed.oddsSportKey] : null;
+      const games = await fetchGamesForDate(api, date, errors, {
+        league: leagueId,
+        season: leagueId ? guessedSeason : null,
+      });
       let best = null;
       let bestScore = 0;
       for (const g of games) {
@@ -988,18 +1032,13 @@ async function enrichSelections(selections, opts, errors) {
 
       let homeRecent = [];
       let awayRecent = [];
-      const leagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
-
-      const matchDate = new Date(seed.commenceTime || Date.now());
-      const month = matchDate.getUTCMonth() + 1;
-      const year = matchDate.getUTCFullYear();
-      const guessedSeason = (api === 'football' && month <= 7) ? year - 1 : year;
+      const apiSportsLeagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
       const season = best?.league?.season || best?.season || guessedSeason;
 
       await sleep(20);
-      homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId, season, fixtureId, seed });
+      homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId: apiSportsLeagueId, season, fixtureId, seed });
       await sleep(20);
-      awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId, season, fixtureId, seed });
+      awayRecent = await fetchRecentGames(api, teams.away.id, errors, { leagueId: apiSportsLeagueId, season, fixtureId, seed });
 
       const homeStats = summarizeForm(homeRecent, teams.home.id, api);
       const awayStats = summarizeForm(awayRecent, teams.away.id, api);
