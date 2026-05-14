@@ -1072,7 +1072,12 @@ async function searchTeamByName(api, teamName, errors) {
 }
 
 async function enrichSelections(selections, opts, errors) {
-  const maxApiEvents = opts.maxApiEvents;
+  // ▶ DÉFENSIF : si maxApiEvents arrive en null/undefined/0, on force 60
+  const maxApiEvents = (typeof opts.maxApiEvents === 'number' && opts.maxApiEvents > 0)
+    ? opts.maxApiEvents
+    : 60;
+  errors.push({ source: 'paridex', message: `[v8.1] enrichSelections démarré avec ${selections.length} sélections, maxApiEvents=${maxApiEvents}` });
+
   const byEvent = [];
   const seen = new Set();
 
@@ -1099,6 +1104,8 @@ async function enrichSelections(selections, opts, errors) {
     if (byEvent.length >= maxApiEvents) break;
   }
 
+  errors.push({ source: 'paridex', message: `[v8.1] byEvent après dédoublonnage: ${byEvent.length} matchs uniques` });
+
   // ▶ ÉCONOMIE QUOTA : on limite le nombre de matchs à enrichir en fonction du quota restant
   //   Chaque match consomme ~3-5 requêtes.
   const reqPerMatch = 4;
@@ -1109,6 +1116,11 @@ async function enrichSelections(selections, opts, errors) {
     : byEvent.length;
 
   const eventsToEnrich = byEvent.slice(0, Math.min(byEvent.length, maxAffordable, maxApiEvents));
+
+  errors.push({
+    source: 'paridex',
+    message: `[v8.1] eventsToEnrich: ${eventsToEnrich.length} (byEvent=${byEvent.length}, maxAffordable=${maxAffordable}, maxApiEvents=${maxApiEvents}, quotaRemaining=${apiSportsQuota.remaining})`,
+  });
 
   if (apiSportsQuota.remaining !== null && eventsToEnrich.length < byEvent.length) {
     errors.push({
@@ -1130,6 +1142,7 @@ async function enrichSelections(selections, opts, errors) {
     }
 
     try {
+      errors.push({ source: 'paridex', message: `[v8.1] Tentative enrichissement: ${seed.homeTeam} vs ${seed.awayTeam} (${api})` });
       // ▶ ÉTAPE 1 : Trouver les IDs des 2 équipes par recherche de nom
       await sleep(15);
       const homeTeam = await searchTeamByName(api, seed.homeTeam, errors);
