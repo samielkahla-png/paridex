@@ -1007,11 +1007,41 @@ async function searchTeamByName(api, teamName, errors) {
   const key = `${api}:teamSearch:${teamName.toLowerCase()}`;
   return cached(key, 7 * 24 * 60 * 60 * 1000, async () => { // cache 7 jours
     try {
-      // API-Football : /teams?search=Palmeiras (min 3 caractères)
-      const search = teamName.length >= 3 ? teamName.substring(0, 30) : teamName;
+      // ▶ API-Football : /teams?search= (min 3 caractères, accepte le nom complet)
+      //   On nettoie le nom (retire FC, CF, SC, club, etc.) pour maximiser les chances
+      let search = teamName.trim();
+      // Garde le nom complet jusqu'à 30 chars
+      if (search.length < 3) {
+        errors.push({ source: api, message: `Nom équipe trop court : "${teamName}"` });
+        return null;
+      }
+      search = search.substring(0, 30);
+
       const body = await apiSports(api, '/teams', { search });
       const arr = Array.isArray(body?.response) ? body.response : [];
-      if (arr.length === 0) return null;
+
+      if (arr.length === 0) {
+        // ▶ FALLBACK : si 0 résultat, essaie avec le premier mot significatif
+        //   Ex: "Inter Miami CF" → "Miami", "Bayer Leverkusen" → "Leverkusen"
+        const words = teamName.split(/\s+/).filter(w => w.length >= 4 && !/^(fc|sc|cf|sk|sv|ac|as|le|la|de|du|of)$/i.test(w));
+        if (words.length > 0) {
+          const fallback = words[words.length - 1]; // dernier mot souvent le plus distinctif
+          if (fallback.length >= 3 && fallback !== search) {
+            try {
+              const fallbackBody = await apiSports(api, '/teams', { search: fallback });
+              const fallbackArr = Array.isArray(fallbackBody?.response) ? fallbackBody.response : [];
+              if (fallbackArr.length > 0) {
+                arr.push(...fallbackArr);
+              }
+            } catch (e) { /* ignore */ }
+          }
+        }
+      }
+
+      if (arr.length === 0) {
+        errors.push({ source: api, message: `API-Sports : 0 équipe trouvée pour "${teamName}"` });
+        return null;
+      }
 
       // Trouve la meilleure correspondance par similarité de nom
       let best = null;
@@ -1025,7 +1055,13 @@ async function searchTeamByName(api, teamName, errors) {
           best = { id: teamData.id, name: apiName, similarity: sim };
         }
       }
-      if (best && best.similarity >= 0.7) return best;
+      // ▶ Seuil abaissé à 0.55 (Inter Miami CF ≈ Inter Miami sim ~0.75 OK)
+      //   En dessous de 0.55, c'est vraiment douteux
+      if (best && best.similarity >= 0.55) return best;
+      errors.push({
+        source: api,
+        message: `Équipe "${teamName}" : meilleur match "${best?.name}" avec similarité ${best?.similarity?.toFixed(2)} (rejeté car < 0.55)`,
+      });
       return null;
     } catch (err) {
       errors.push({ source: api, message: `Recherche équipe "${teamName}" échouée : ${err.message}` });
