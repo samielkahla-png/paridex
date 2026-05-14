@@ -1002,18 +1002,13 @@ async function enrichSelections(selections, opts, errors) {
     try {
       const date = dateOnly(seed.commenceTime || new Date());
 
-      // ▶ Cible la ligue + saison pour économiser le quota et avoir TOUS les matchs
+      // ▶ Cible la ligue API-Football pour avoir TOUS les matchs de cette ligue ce jour
+      //   league + date suffit (pas besoin de season qui varie par championnat).
       //   Sans ça, /fixtures?date=X retourne max 100 matchs random du monde entier.
-      const matchDate = new Date(seed.commenceTime || Date.now());
-      const month = matchDate.getUTCMonth() + 1;
-      const year = matchDate.getUTCFullYear();
-      // Foot européen entre janvier et juillet = saison N-1
-      const guessedSeason = (api === 'football' && month <= 7) ? year - 1 : year;
-
       const leagueId = api === 'football' ? ODDS_TO_APIFOOTBALL_LEAGUE[seed.oddsSportKey] : null;
       const games = await fetchGamesForDate(api, date, errors, {
         league: leagueId,
-        season: leagueId ? guessedSeason : null,
+        // PAS de season ici : chaque championnat a son propre calendrier (européen vs sud-américain vs MLS)
       });
       let best = null;
       let bestScore = 0;
@@ -1022,7 +1017,14 @@ async function enrichSelections(selections, opts, errors) {
         if (sc > bestScore) { best = g; bestScore = sc; }
       }
       if (!best || bestScore < 0.72) {
-        errors.push({ source: api, event: seed.eventId, message: `Match non retrouvé dans API-Sports (${api})`, score: Number(bestScore.toFixed(2)) });
+        errors.push({
+          source: api,
+          event: seed.eventId,
+          message: `Match non retrouvé dans API-Sports (${api})`,
+          score: Number(bestScore.toFixed(2)),
+          leagueId,
+          gamesFound: games.length,
+        });
         continue;
       }
 
@@ -1033,7 +1035,8 @@ async function enrichSelections(selections, opts, errors) {
       let homeRecent = [];
       let awayRecent = [];
       const apiSportsLeagueId = best?.league?.id || best?.league?.ID || best?.leagueId;
-      const season = best?.league?.season || best?.season || guessedSeason;
+      // La saison vient toujours de l'API (best.league.season), donc plus de devinette nécessaire
+      const season = best?.league?.season || best?.season || new Date(seed.commenceTime || Date.now()).getUTCFullYear();
 
       await sleep(20);
       homeRecent = await fetchRecentGames(api, teams.home.id, errors, { leagueId: apiSportsLeagueId, season, fixtureId, seed });
