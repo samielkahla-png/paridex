@@ -318,7 +318,9 @@ async function fetchOddsForSport(oddsKey, sportKey, fromIso, toIso, errors) {
   const url = new URL(`${ODDS_BASE}/sports/${encodeURIComponent(sportKey)}/odds`);
   url.searchParams.set('apiKey', oddsKey);
   url.searchParams.set('regions', 'eu,uk,us,au');
-  url.searchParams.set('markets', 'h2h');
+  // ▶ MULTI-MARCHÉS : h2h (1X2) + totals (Over/Under) + btts (Both Teams to Score)
+  // → Maximise les opportunités de "value bet" et diversifie les combinés
+  url.searchParams.set('markets', 'h2h,totals,btts');
   url.searchParams.set('oddsFormat', 'decimal');
   url.searchParams.set('dateFormat', 'iso');
   url.searchParams.set('commenceTimeFrom', fromIso);
@@ -358,59 +360,134 @@ function makeSelectionsFromOdds(events, sportKey, opts) {
   const risk = opts.risk;
   const unibetOnly = opts.unibetOnly;
 
-  const oddMin = risk === 'safe' ? 1.12 : risk === 'bold' ? 1.18 : 1.14;
-  const oddMax = risk === 'safe' ? 1.65 : risk === 'bold' ? 2.85 : 2.15;
+  // ▶ Plages de cotes par risque (légèrement élargies pour Over/BTTS)
+  const oddMin = risk === 'safe' ? 1.20 : risk === 'bold' ? 1.30 : 1.25;
+  const oddMax = risk === 'safe' ? 2.20 : risk === 'bold' ? 4.50 : 3.20;
 
   for (const event of events) {
     const pickedBook = findBookmaker(event, unibetOnly);
     if (!pickedBook) continue;
-    const market = (pickedBook.bookmaker.markets || []).find(m => m.key === 'h2h');
-    if (!market || !Array.isArray(market.outcomes)) continue;
+    const markets = pickedBook.bookmaker.markets || [];
+    if (!markets.length) continue;
 
     const homeTeam = event.home_team || event.homeTeam || '';
     const awayTeam = event.away_team || event.awayTeam || '';
     const commenceTime = event.commence_time || event.commenceTime;
     const eventId = `${sportKey}:${norm(homeTeam)}:${norm(awayTeam)}:${dateOnly(commenceTime || new Date())}`;
 
-    for (const out of market.outcomes) {
-      const price = Number(out.price);
-      if (!Number.isFinite(price) || price < oddMin || price > oddMax) continue;
+    const baseSel = {
+      eventId,
+      oddsEventId: event.id,
+      oddsSportKey: sportKey,
+      apiSport: api,
+      sport: emoji,
+      sportName: api,
+      league: defaultLeague,
+      homeTeam,
+      awayTeam,
+      commenceTime,
+      kickoff: commenceTime ? formatKickoff(commenceTime) : '',
+      bookmaker: pickedBook.bookmaker.title || pickedBook.bookmaker.key || 'Bookmaker',
+      bookmakerKey: pickedBook.bookmaker.key,
+      isUnibet: pickedBook.isUnibet,
+      dataQuality: 'odds_only',
+      apiSports: null,
+      apiFootball: null,
+    };
 
-      const name = String(out.name || '');
-      const isHome = similarity(name, homeTeam) >= 0.78;
-      const isAway = similarity(name, awayTeam) >= 0.78;
-      const isDraw = /^draw$|^nul$|^match nul$/i.test(name);
-      if (!isHome && !isAway && !isDraw) continue;
+    // ═══ Marché 1 : H2H (1X2 / Résultat du match) ═══
+    const h2h = markets.find(m => m.key === 'h2h');
+    if (h2h && Array.isArray(h2h.outcomes)) {
+      for (const out of h2h.outcomes) {
+        const price = Number(out.price);
+        if (!Number.isFinite(price) || price < oddMin || price > oddMax) continue;
 
-      const probability = 100 / price;
-      selections.push({
-        id: `${eventId}:${norm(name)}:${price}`,
-        eventId,
-        oddsEventId: event.id,
-        oddsSportKey: sportKey,
-        apiSport: api,
-        sport: emoji,
-        sportName: api,
-        league: defaultLeague,
-        homeTeam,
-        awayTeam,
-        commenceTime,
-        kickoff: commenceTime ? formatKickoff(commenceTime) : '',
-        market: 'Résultat du match',
-        pick: isDraw ? 'Match nul' : (isHome ? homeTeam : awayTeam),
-        pickSide: isDraw ? 'draw' : (isHome ? 'home' : 'away'),
-        odd: price,
-        bookmaker: pickedBook.bookmaker.title || pickedBook.bookmaker.key || 'Bookmaker',
-        bookmakerKey: pickedBook.bookmaker.key,
-        isUnibet: pickedBook.isUnibet,
-        baseProbability: probability,
-        probability,
-        confidence: clamp(Math.round(probability * 0.78), 30, 72),
-        dataQuality: 'odds_only',
-        apiSports: null,
-        apiFootball: null,
-        reason: `${pickedBook.isUnibet ? 'Cote Unibet réelle' : 'Cote réelle bookmaker'} : ${price.toFixed(2)}. En attente d'enrichissement ${api}.`,
-      });
+        const name = String(out.name || '');
+        const isHome = similarity(name, homeTeam) >= 0.78;
+        const isAway = similarity(name, awayTeam) >= 0.78;
+        const isDraw = /^draw$|^nul$|^match nul$/i.test(name);
+        if (!isHome && !isAway && !isDraw) continue;
+
+        const probability = 100 / price;
+        selections.push({
+          ...baseSel,
+          id: `${eventId}:h2h:${norm(name)}:${price}`,
+          market: 'Résultat (1X2)',
+          marketType: 'h2h',
+          pick: isDraw ? 'Match nul' : (isHome ? homeTeam : awayTeam),
+          pickSide: isDraw ? 'draw' : (isHome ? 'home' : 'away'),
+          odd: price,
+          baseProbability: probability,
+          probability,
+          confidence: clamp(Math.round(probability * 0.78), 30, 72),
+          reason: `${pickedBook.isUnibet ? 'Cote Unibet' : 'Cote bookmaker'} 1X2 : ${price.toFixed(2)}`,
+        });
+      }
+    }
+
+    // ═══ Marché 2 : TOTALS (Over/Under buts) ═══
+    const totals = markets.find(m => m.key === 'totals');
+    if (totals && Array.isArray(totals.outcomes)) {
+      for (const out of totals.outcomes) {
+        const price = Number(out.price);
+        if (!Number.isFinite(price) || price < oddMin || price > oddMax) continue;
+
+        const point = Number(out.point);
+        if (!Number.isFinite(point)) continue;
+
+        const name = String(out.name || '').toLowerCase();
+        const isOver = name.includes('over');
+        const isUnder = name.includes('under');
+        if (!isOver && !isUnder) continue;
+
+        // Préférence : Over/Under 2.5 buts (foot) ou les lignes principales
+        // En foot : 2.5 / 3.5 ; en basket/NBA : seuils plus hauts (220+) ; on garde tout dans la plage de cotes
+        const probability = 100 / price;
+        const pickLabel = isOver ? `+${point} buts` : `−${point} buts`;
+        selections.push({
+          ...baseSel,
+          id: `${eventId}:tot:${isOver?'over':'under'}_${point}:${price}`,
+          market: 'Buts (Over/Under)',
+          marketType: isOver ? 'over' : 'under',
+          marketPoint: point,
+          pick: pickLabel,
+          pickSide: isOver ? 'over' : 'under',
+          odd: price,
+          baseProbability: probability,
+          probability,
+          confidence: clamp(Math.round(probability * 0.78), 30, 72),
+          reason: `${pickedBook.isUnibet ? 'Cote Unibet' : 'Cote bookmaker'} ${pickLabel} : ${price.toFixed(2)}`,
+        });
+      }
+    }
+
+    // ═══ Marché 3 : BTTS (Les 2 équipes marquent) ═══
+    const btts = markets.find(m => m.key === 'btts');
+    if (btts && Array.isArray(btts.outcomes)) {
+      for (const out of btts.outcomes) {
+        const price = Number(out.price);
+        if (!Number.isFinite(price) || price < oddMin || price > oddMax) continue;
+
+        const name = String(out.name || '').toLowerCase();
+        const isYes = /^yes$/.test(name) || name === 'oui';
+        const isNo = /^no$/.test(name) || name === 'non';
+        if (!isYes && !isNo) continue;
+
+        const probability = 100 / price;
+        selections.push({
+          ...baseSel,
+          id: `${eventId}:btts:${isYes?'yes':'no'}:${price}`,
+          market: 'Les 2 marquent',
+          marketType: isYes ? 'btts_yes' : 'btts_no',
+          pick: isYes ? 'Les 2 marquent : Oui' : 'Les 2 marquent : Non',
+          pickSide: isYes ? 'btts_yes' : 'btts_no',
+          odd: price,
+          baseProbability: probability,
+          probability,
+          confidence: clamp(Math.round(probability * 0.78), 30, 72),
+          reason: `${pickedBook.isUnibet ? 'Cote Unibet' : 'Cote bookmaker'} BTTS ${isYes?'Oui':'Non'} : ${price.toFixed(2)}`,
+        });
+      }
     }
   }
 
@@ -601,18 +678,80 @@ function summarizeForm(games, teamId, api) {
     if (!isFinishedGame(g, api)) continue;
     const r = resultForTeam(g, teamId, api);
     if (!r) continue;
+    const t = getTeams(g, api);
+    const isHome = String(t.home.id) === String(teamId);
+    const homeScore = extractScore(g, 'home', api);
+    const awayScore = extractScore(g, 'away', api);
     rows.push({
       result: r,
       date: getGameDate(g) || '',
+      isHome,
+      goalsFor: isHome ? homeScore : awayScore,
+      goalsAgainst: isHome ? awayScore : homeScore,
     });
   }
   rows.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  // Forme globale (5 derniers)
   const lastRows = rows.slice(-5);
   const last = lastRows.map(x => x.result);
   const W = last.filter(x => x === 'W').length;
   const D = last.filter(x => x === 'D').length;
   const L = last.filter(x => x === 'L').length;
-  return { form: last, W, D, L, played: last.length, label: last.length ? last.join('') : 'n/d' };
+
+  // ▶ NOUVELLES METRIQUES PRÉDICTIVES
+  // Forme domicile/extérieur séparée (signal fort en foot)
+  const homeRows = rows.slice(-10).filter(r => r.isHome);
+  const awayRows = rows.slice(-10).filter(r => !r.isHome);
+  const homeForm = {
+    W: homeRows.filter(r => r.result === 'W').length,
+    D: homeRows.filter(r => r.result === 'D').length,
+    L: homeRows.filter(r => r.result === 'L').length,
+    played: homeRows.length,
+  };
+  const awayForm = {
+    W: awayRows.filter(r => r.result === 'W').length,
+    D: awayRows.filter(r => r.result === 'D').length,
+    L: awayRows.filter(r => r.result === 'L').length,
+    played: awayRows.length,
+  };
+
+  // Momentum : moyenne 5 derniers vs moyenne 5 d'avant (en points : W=3, D=1, L=0)
+  const last5pts = last.reduce((a, r) => a + (r === 'W' ? 3 : r === 'D' ? 1 : 0), 0);
+  const prev5 = rows.slice(-10, -5).map(x => x.result);
+  const prev5pts = prev5.reduce((a, r) => a + (r === 'W' ? 3 : r === 'D' ? 1 : 0), 0);
+  const momentum = prev5.length ? (last5pts / 15) - (prev5pts / Math.max(prev5.length * 3, 1)) : 0;
+
+  // Série en cours (streak)
+  let streak = 0;
+  let streakType = null;
+  for (let i = last.length - 1; i >= 0; i--) {
+    if (!streakType) { streakType = last[i]; streak = 1; }
+    else if (last[i] === streakType) streak++;
+    else break;
+  }
+
+  // Buts (signal pour Over/BTTS)
+  const validScored = rows.slice(-10).filter(r => Number.isFinite(r.goalsFor) && Number.isFinite(r.goalsAgainst));
+  const avgGoalsFor = validScored.length ? validScored.reduce((a, r) => a + r.goalsFor, 0) / validScored.length : null;
+  const avgGoalsAgainst = validScored.length ? validScored.reduce((a, r) => a + r.goalsAgainst, 0) / validScored.length : null;
+  const over25Count = validScored.filter(r => r.goalsFor + r.goalsAgainst > 2.5).length;
+  const over25Rate = validScored.length ? over25Count / validScored.length : null;
+  const bttsCount = validScored.filter(r => r.goalsFor >= 1 && r.goalsAgainst >= 1).length;
+  const bttsRate = validScored.length ? bttsCount / validScored.length : null;
+
+  return {
+    form: last, W, D, L, played: last.length,
+    label: last.length ? last.join('') : 'n/d',
+    homeForm, awayForm,
+    momentum: Number(momentum.toFixed(3)),
+    streak, streakType,
+    avgGoalsFor: avgGoalsFor != null ? Number(avgGoalsFor.toFixed(2)) : null,
+    avgGoalsAgainst: avgGoalsAgainst != null ? Number(avgGoalsAgainst.toFixed(2)) : null,
+    over25Rate: over25Rate != null ? Number(over25Rate.toFixed(2)) : null,
+    bttsRate: bttsRate != null ? Number(bttsRate.toFixed(2)) : null,
+    sampleSize: validScored.length,
+  };
 }
 
 async function fetchFootballPrediction(fixtureId, errors) {
@@ -629,11 +768,150 @@ async function fetchFootballPrediction(fixtureId, errors) {
   });
 }
 
-function sideFormScore(selection, homeStats, awayStats) {
-  const chosen = selection.pickSide === 'home' ? homeStats : selection.pickSide === 'away' ? awayStats : null;
-  const other = selection.pickSide === 'home' ? awayStats : selection.pickSide === 'away' ? homeStats : null;
-  if (!chosen || !other || chosen.played < 3 || other.played < 3) return 0;
-  return ((chosen.W - chosen.L) - (other.W - other.L)) * 4 + (chosen.W - other.W) * 3;
+// ════════════════════════════════════════════════════════
+// 🧠 MOTEUR PRÉDICTIF — Calcule la probabilité RÉELLE en croisant :
+// - Forme générale (W/D/L 5 derniers)
+// - Forme domicile/extérieur (signal fort en foot)
+// - Momentum (tendance des 5 derniers vs précédents)
+// - Série en cours
+// - Predictions API-Football (6 algos agrégés)
+// - Probabilité implicite des cotes (sagesse du marché)
+//
+// Renvoie une vraie probabilité 0-100, et détecte le VALUE BET
+// (cote sous-évaluée par le bookmaker = profit espéré positif).
+// ════════════════════════════════════════════════════════
+function computePredictiveProbability(selection, homeStats, awayStats, prediction) {
+  // Probabilité de base = celle implicite des cotes (sagesse du marché, ~5% de marge)
+  const impliedProb = selection.baseProbability || (100 / selection.odd);
+  const marketProb = impliedProb * 0.95; // retire la marge bookmaker
+
+  let predictiveProb = marketProb;
+  const signals = [];
+
+  // ── Marché H2H (1X2) : utilise forme home/away + predictions ──
+  if (selection.marketType === 'h2h') {
+    const chosen = selection.pickSide === 'home' ? homeStats : (selection.pickSide === 'away' ? awayStats : null);
+    const other = selection.pickSide === 'home' ? awayStats : (selection.pickSide === 'away' ? homeStats : null);
+
+    if (chosen && other && chosen.played >= 3 && other.played >= 3) {
+      // Score forme = points moyens (0..3) normalisés sur 100
+      const chosenPts = chosen.W * 3 + chosen.D * 1;
+      const otherPts = other.W * 3 + other.D * 1;
+      const formGap = (chosenPts - otherPts) / Math.max(chosen.played + other.played, 1);
+      // Ajuste la proba : +/- 12% max selon la différence de forme
+      const formAdj = clamp(formGap * 4, -12, 12);
+      predictiveProb += formAdj;
+      if (Math.abs(formAdj) > 2) signals.push(`forme ${formAdj > 0 ? '+' : ''}${formAdj.toFixed(1)}`);
+
+      // Forme spécifique domicile (équipe à domicile gagnant 'home')
+      if (selection.pickSide === 'home' && chosen.homeForm && chosen.homeForm.played >= 3) {
+        const homeRate = chosen.homeForm.W / chosen.homeForm.played;
+        const homeAdj = clamp((homeRate - 0.4) * 10, -5, 8);
+        predictiveProb += homeAdj;
+        if (Math.abs(homeAdj) > 1.5) signals.push(`dom ${homeAdj > 0 ? '+' : ''}${homeAdj.toFixed(1)}`);
+      }
+
+      // Momentum : équipes en série gagnante / défaite
+      if (chosen.momentum !== undefined) {
+        const momAdj = clamp(chosen.momentum * 15, -6, 6);
+        predictiveProb += momAdj;
+        if (Math.abs(momAdj) > 2) signals.push(`mom ${momAdj > 0 ? '+' : ''}${momAdj.toFixed(1)}`);
+      }
+
+      // Série de victoires/défaites
+      if (chosen.streak >= 3 && chosen.streakType === 'W') {
+        predictiveProb += 4;
+        signals.push(`série ${chosen.streak}V`);
+      } else if (chosen.streak >= 3 && chosen.streakType === 'L') {
+        predictiveProb -= 5;
+        signals.push(`série ${chosen.streak}D`);
+      }
+    }
+
+    // Predictions API-Football (croise avec 6 algos)
+    if (prediction?.predictions) {
+      const p = prediction.predictions;
+      const winnerName = p?.winner?.name || '';
+      if (winnerName && similarity(winnerName, selection.pick) >= 0.72) {
+        predictiveProb += 6;
+        signals.push('AF winner ✓');
+      }
+      const pct = p?.percent || {};
+      const target = selection.pickSide === 'home' ? pct.home : (selection.pickSide === 'away' ? pct.away : pct.draw);
+      if (target && typeof target === 'string') {
+        const num = Number(target.replace('%', ''));
+        if (Number.isFinite(num)) {
+          // Pondère la pred vs marché : moyenne 30% pred / 70% marché ajusté
+          const blend = predictiveProb * 0.7 + num * 0.3;
+          predictiveProb = blend;
+          signals.push(`AF ${num}%`);
+        }
+      }
+    }
+  }
+
+  // ── Marché TOTALS (Over/Under buts) : utilise avgGoals + over25Rate ──
+  if (selection.marketType === 'over' || selection.marketType === 'under') {
+    if (homeStats?.avgGoalsFor != null && awayStats?.avgGoalsFor != null) {
+      const projectedGoals = (homeStats.avgGoalsFor + homeStats.avgGoalsAgainst + awayStats.avgGoalsFor + awayStats.avgGoalsAgainst) / 2;
+      const point = selection.marketPoint || 2.5;
+
+      if (selection.marketType === 'over') {
+        // Plus les buts moyens dépassent le seuil, plus l'Over est probable
+        const goalAdj = clamp((projectedGoals - point) * 8, -15, 15);
+        predictiveProb += goalAdj;
+        signals.push(`buts moy ${projectedGoals.toFixed(1)}`);
+      } else {
+        const goalAdj = clamp((point - projectedGoals) * 8, -15, 15);
+        predictiveProb += goalAdj;
+        signals.push(`buts moy ${projectedGoals.toFixed(1)}`);
+      }
+
+      // Bonus si l'historique confirme (over25Rate sur les 2 équipes)
+      if (homeStats.over25Rate != null && awayStats.over25Rate != null) {
+        const avgOver = (homeStats.over25Rate + awayStats.over25Rate) / 2;
+        if (selection.marketType === 'over' && avgOver >= 0.6) {
+          predictiveProb += 4;
+          signals.push(`O2.5 ${Math.round(avgOver * 100)}%`);
+        } else if (selection.marketType === 'under' && avgOver <= 0.4) {
+          predictiveProb += 4;
+          signals.push(`U2.5 hist`);
+        }
+      }
+    }
+  }
+
+  // ── Marché BTTS : utilise bttsRate des 2 équipes ──
+  if (selection.marketType === 'btts_yes' || selection.marketType === 'btts_no') {
+    if (homeStats?.bttsRate != null && awayStats?.bttsRate != null) {
+      const avgBtts = (homeStats.bttsRate + awayStats.bttsRate) / 2;
+      if (selection.marketType === 'btts_yes') {
+        const adj = clamp((avgBtts - 0.5) * 30, -15, 15);
+        predictiveProb += adj;
+        signals.push(`BTTS hist ${Math.round(avgBtts * 100)}%`);
+      } else {
+        const adj = clamp((0.5 - avgBtts) * 30, -15, 15);
+        predictiveProb += adj;
+        signals.push(`BTTS no ${Math.round((1 - avgBtts) * 100)}%`);
+      }
+    }
+  }
+
+  predictiveProb = clamp(predictiveProb, 5, 95);
+
+  // ▶ DÉTECTION VALUE BET
+  // Si proba prédictive > proba implicite du bookmaker → cote sous-évaluée = profit espéré
+  // Edge = (probaPredictive/100) × cote − 1 (positif = value bet)
+  const edge = (predictiveProb / 100) * selection.odd - 1;
+  const valueBet = edge > 0.05; // au moins 5% d'edge
+
+  return {
+    predictiveProb,
+    impliedProb,
+    edge,
+    valueBet,
+    signals,
+  };
 }
 
 function adviceText(selection, match, homeStats, awayStats, prediction) {
@@ -734,17 +1012,15 @@ async function enrichSelections(selections, opts, errors) {
       continue;
     }
 
-    const formBonus = sideFormScore(s, e.homeStats, e.awayStats);
-    let predBonus = 0;
-    if (e.prediction?.predictions) {
-      const p = e.prediction.predictions;
-      const winnerName = p?.winner?.name || '';
-      if (winnerName && similarity(winnerName, s.pick) >= 0.72) predBonus += 10;
-      if (typeof p?.percent?.home === 'string' && s.pickSide === 'home') predBonus += Number(p.percent.home.replace('%', '')) > 45 ? 5 : 0;
-      if (typeof p?.percent?.away === 'string' && s.pickSide === 'away') predBonus += Number(p.percent.away.replace('%', '')) > 45 ? 5 : 0;
-    }
+    // ▶ MOTEUR PRÉDICTIF : croise toutes les sources de données
+    const pred = computePredictiveProbability(s, e.homeStats, e.awayStats, e.prediction);
 
-    const confidence = clamp(Math.round(s.baseProbability * 0.75 + 18 + formBonus + predBonus), 42, 92);
+    // Confidence finale = pondération entre proba prédictive et value bet
+    // - 70% probabilité prédictive (forme + predictions)
+    // - 30% bonus "value bet" (cote sous-évaluée)
+    const valueBonus = pred.valueBet ? Math.min(15, pred.edge * 30) : 0;
+    const confidence = clamp(Math.round(pred.predictiveProb * 0.7 + valueBonus + 25), 35, 94);
+
     const apiPayload = {
       provider: e.api === 'football' ? 'API-Football' : `API-${e.api}`,
       api: e.api,
@@ -755,14 +1031,24 @@ async function enrichSelections(selections, opts, errors) {
       homeForm: e.homeStats,
       awayForm: e.awayStats,
       prediction: e.prediction,
-      advice: adviceText({ ...s, league: e.leagueName }, null, e.homeStats, e.awayStats, e.prediction),
+      predictiveProb: Number(pred.predictiveProb.toFixed(1)),
+      impliedProb: Number(pred.impliedProb.toFixed(1)),
+      edge: Number((pred.edge * 100).toFixed(1)),  // en %
+      valueBet: pred.valueBet,
+      signals: pred.signals,
+      advice: adviceText({ ...s, league: e.leagueName }, null, e.homeStats, e.awayStats, e.prediction)
+        + (pred.valueBet ? ` 💎 VALUE BET : edge ${(pred.edge * 100).toFixed(1)}%` : '')
+        + (pred.signals.length ? ` · Signaux : ${pred.signals.join(', ')}` : ''),
     };
 
     enriched.push({
       ...s,
       league: e.leagueName || s.league,
       confidence,
-      probability: clamp(s.baseProbability + Math.max(0, formBonus * 0.35) + predBonus * 0.25, 20, 95),
+      probability: pred.predictiveProb,
+      predictiveProb: pred.predictiveProb,
+      edge: pred.edge,
+      valueBet: pred.valueBet,
       dataQuality: 'full',
       apiSports: apiPayload,
       apiFootball: apiPayload,
@@ -784,9 +1070,10 @@ function legLimitForRisk(risk, forced) {
 }
 
 function minConfidenceForRisk(risk) {
-  if (risk === 'safe') return 62;
-  if (risk === 'bold') return 45;
-  return 52;
+  // Seuils plus exigeants pour maximiser le taux de réussite
+  if (risk === 'safe') return 68;  // ↑ de 62 — exige forte confiance
+  if (risk === 'bold') return 48;  // ↑ de 45
+  return 58;                        // ↑ de 52 — modéré plus sélectif
 }
 
 function comboTitle(size, idx) {
@@ -820,10 +1107,55 @@ function buildCombos(selections, opts) {
     const odd = product(legs, l => Number(l.odd || 1));
     const probability = product(legs, l => Number(l.probability || 50) / 100) * 100;
     const avgConf = legs.reduce((a, l) => a + l.confidence, 0) / legs.length;
+
+    // ▶ PÉNALITÉ DU MAILLON FAIBLE
+    // Un combiné est aussi solide que sa pire sélection. On pénalise donc le minimum.
+    const minConfLeg = Math.min(...legs.map(l => l.confidence));
+    const weakLinkPenalty = Math.max(0, (avgConf - minConfLeg) * 0.5);
+
+    // ▶ BONUS VALUE BETS : nombre de legs avec edge positif
+    const valueLegsCount = legs.filter(l => l.valueBet === true).length;
+    const valueBonus = valueLegsCount * 4; // +4 par value bet
+
+    // ▶ BONUS EDGE TOTAL (somme des edges positifs)
+    const totalEdge = legs.reduce((a, l) => a + Math.max(0, (l.edge || 0) * 100), 0);
+    const edgeBonus = Math.min(totalEdge * 0.3, 8); // cap à +8
+
+    // ▶ BONUS UNIBET (rapidité de pari Unibet exclusif)
     const unibetRatio = legs.filter(l => l.isUnibet).length / legs.length;
+    const unibetBonus = unibetRatio * 5;
+
+    // ▶ BONUS DIVERSITÉ SPORTS
     const sportDiversity = new Set(legs.map(l => l.apiSport)).size;
-    const score = avgConf + unibetRatio * 7 + sportDiversity * 1.5 - Math.max(0, odd - 8) * 2;
-    candidates.push({ legs, odd, probability, confidence: clamp(Math.round(score), 30, 94), score });
+    const diversityBonus = (sportDiversity - 1) * 2;
+
+    // ▶ BONUS DIVERSITÉ MARCHÉS
+    const marketDiversity = new Set(legs.map(l => l.marketType)).size;
+    const marketBonus = (marketDiversity - 1) * 2;
+
+    // ▶ PÉNALITÉ COTE EXTRÊME (cote totale > 8 = peu fiable)
+    const extremePenalty = Math.max(0, odd - 8) * 2.5;
+
+    const score = avgConf
+      - weakLinkPenalty
+      + valueBonus
+      + edgeBonus
+      + unibetBonus
+      + diversityBonus
+      + marketBonus
+      - extremePenalty;
+
+    candidates.push({
+      legs,
+      odd,
+      probability,
+      avgConf,
+      minConfLeg,
+      valueLegsCount,
+      totalEdge,
+      confidence: clamp(Math.round(score), 30, 94),
+      score,
+    });
   }
 
   for (let size = 2; size <= maxLegs; size++) {
@@ -862,18 +1194,25 @@ function buildCombos(selections, opts) {
     if (selected.length >= opts.limit) break;
   }
 
-  return selected.slice(0, opts.limit).map((c, idx) => ({
-    title: comboTitle(c.legs.length, idx),
-    rank: idx + 1,
-    odd: Number(c.odd.toFixed(2)),
-    probability: Number(c.probability.toFixed(1)),
-    confidence: c.confidence,
-    dataQuality: c.legs.every(l => l.dataQuality === 'full') ? 'full' : 'partial',
-    mode: c.legs.every(l => l.dataQuality === 'full') ? 'enriched' : 'partial',
-    legs: c.legs,
-    verdict: c.legs.every(l => l.dataQuality === 'full') ? '✅ Cotes + API-Sports' : 'ℹ️ Combiné partiel',
-    reason: c.legs.map(l => `${l.sport} ${l.league} : ${l.pick} @${l.odd.toFixed(2)}`).join(' · '),
-  }));
+  return selected.slice(0, opts.limit).map((c, idx) => {
+    const valueLabel = c.valueLegsCount > 0 ? ` · 💎 ${c.valueLegsCount} value bet${c.valueLegsCount > 1 ? 's' : ''}` : '';
+    return {
+      title: comboTitle(c.legs.length, idx),
+      rank: idx + 1,
+      odd: Number(c.odd.toFixed(2)),
+      probability: Number(c.probability.toFixed(1)),
+      confidence: c.confidence,
+      valueLegsCount: c.valueLegsCount,
+      totalEdge: Number(c.totalEdge.toFixed(1)),
+      avgConf: Number(c.avgConf.toFixed(1)),
+      minConfLeg: c.minConfLeg,
+      dataQuality: c.legs.every(l => l.dataQuality === 'full') ? 'full' : 'partial',
+      mode: c.legs.every(l => l.dataQuality === 'full') ? 'enriched' : 'partial',
+      legs: c.legs,
+      verdict: c.legs.every(l => l.dataQuality === 'full') ? `✅ Cotes + API-Sports${valueLabel}` : `ℹ️ Combiné partiel${valueLabel}`,
+      reason: c.legs.map(l => `${l.sport} ${l.league} : ${l.pick} @${l.odd.toFixed(2)}${l.valueBet ? ' 💎' : ''}`).join(' · '),
+    };
+  });
 }
 
 export default async function handler(req, res) {
