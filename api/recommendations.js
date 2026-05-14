@@ -318,9 +318,10 @@ async function fetchOddsForSport(oddsKey, sportKey, fromIso, toIso, errors) {
   const url = new URL(`${ODDS_BASE}/sports/${encodeURIComponent(sportKey)}/odds`);
   url.searchParams.set('apiKey', oddsKey);
   url.searchParams.set('regions', 'eu,uk,us,au');
-  // ▶ MULTI-MARCHÉS : h2h (1X2) + totals (Over/Under) + btts (Both Teams to Score)
-  // → Maximise les opportunités de "value bet" et diversifie les combinés
-  url.searchParams.set('markets', 'h2h,totals,btts');
+  // ▶ MULTI-MARCHÉS : h2h (1X2) + totals (Over/Under buts)
+  // Note : btts n'est pas supporté sur l'endpoint /odds basique de The Odds API.
+  // → On obtient quand même la diversité avec Over/Under (2.5/3.5 buts en foot, totaux en basket/baseball).
+  url.searchParams.set('markets', 'h2h,totals');
   url.searchParams.set('oddsFormat', 'decimal');
   url.searchParams.set('dateFormat', 'iso');
   url.searchParams.set('commenceTimeFrom', fromIso);
@@ -1245,10 +1246,20 @@ export default async function handler(req, res) {
       return [];
     });
     const activeSet = new Set(activeSports.map(s => s.key));
-    const activeRequested = requestedKeys.filter(k => activeSet.size ? activeSet.has(k) : true);
 
-    const skippedInactive = requestedKeys.filter(k => activeSet.size && !activeSet.has(k));
-    for (const k of skippedInactive) errors.push({ source: 'odds', sport: k, message: 'Sport absent de la liste active The Odds API au moment du test.' });
+    // ▶ STRATÉGIE : on essaie TOUS les sports demandés (l'endpoint /odds peut répondre
+    //    même si le sport n'est pas dans /sports actifs). Si l'API rejette, on log.
+    //    Avantage : pas de "0 match" silencieux à cause d'une cache désynchronisée.
+    const activeRequested = requestedKeys.slice(); // on tente tout
+
+    // Log informatif : quels sports demandés ne sont pas dans la liste active
+    const notInActive = requestedKeys.filter(k => activeSet.size && !activeSet.has(k));
+    if (notInActive.length) {
+      errors.push({
+        source: 'odds',
+        message: `Sports demandés non listés actifs (essayés quand même) : ${notInActive.join(', ')}. Actifs sur The Odds API : ${[...activeSet].slice(0, 8).join(', ')}${activeSet.size > 8 ? '...' : ''}`,
+      });
+    }
 
     let allEvents = [];
     let quota = {};
@@ -1256,6 +1267,34 @@ export default async function handler(req, res) {
       const { events, quota: qh } = await fetchOddsForSport(oddsKey, sportKey, fromIso, toIso, errors);
       quota = { ...quota, ...Object.fromEntries(Object.entries(qh).filter(([, v]) => v != null)) };
       for (const ev of events) allEvents.push({ ...ev, _sportKey: sportKey });
+    }
+
+    // ▶ FALLBACK : si 0 événement après les sports demandés, essaie les sports
+    //    POPULAIRES actuellement actifs (sauf ceux déjà essayés)
+    if (allEvents.length === 0 && activeSet.size > 0) {
+      const popularFallbacks = [
+        'soccer_brazil_campeonato',
+        'soccer_argentina_primera_division',
+        'soccer_usa_mls',
+        'basketball_nba',
+        'baseball_mlb',
+        'icehockey_nhl',
+        'soccer_epl',
+        'soccer_uefa_champs_league',
+      ].filter(k => activeSet.has(k) && !activeRequested.includes(k));
+
+      if (popularFallbacks.length) {
+        errors.push({
+          source: 'odds',
+          message: `0 match trouvé pour les sports demandés. Bascule sur sports populaires actifs : ${popularFallbacks.join(', ')}`,
+        });
+        for (const sportKey of popularFallbacks.slice(0, 4)) {
+          const { events, quota: qh } = await fetchOddsForSport(oddsKey, sportKey, fromIso, toIso, errors);
+          quota = { ...quota, ...Object.fromEntries(Object.entries(qh).filter(([, v]) => v != null)) };
+          for (const ev of events) allEvents.push({ ...ev, _sportKey: sportKey });
+          activeRequested.push(sportKey); // ajouter pour la suite
+        }
+      }
     }
 
     let rawSelections = [];
