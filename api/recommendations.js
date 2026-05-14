@@ -1117,7 +1117,7 @@ function buildCombos(selections, opts) {
     candidates = selections.filter(s => s.confidence >= minConfRelaxed);
   }
 
-  const sorted = combos.sort((a, b) => (b.confidence - a.confidence) || (a.odd - b.odd));
+  const sorted = candidates.sort((a, b) => (b.confidence - a.confidence) || (a.odd - b.odd));
 
   const combos = [];
   const maxPool = Math.min(sorted.length, 80);
