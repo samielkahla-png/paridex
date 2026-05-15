@@ -1037,10 +1037,7 @@ async function searchTeamByName(api, teamName, errors) {
   const key = `${CODE_VERSION}:${api}:teamSearch:${teamName.toLowerCase()}`;
   return cached(key, 7 * 24 * 60 * 60 * 1000, async () => { // cache 7 jours
     try {
-      // ▶ API-Football : /teams?search= (min 3 caractères, accepte le nom complet)
-      //   On nettoie le nom (retire FC, CF, SC, club, etc.) pour maximiser les chances
       let search = teamName.trim();
-      // Garde le nom complet jusqu'à 30 chars
       if (search.length < 3) {
         errors.push({ source: api, message: `Nom équipe trop court : "${teamName}"` });
         return null;
@@ -1050,33 +1047,53 @@ async function searchTeamByName(api, teamName, errors) {
       const body = await apiSports(api, '/teams', { search });
       const arr = Array.isArray(body?.response) ? body.response : [];
 
-      if (arr.length === 0) {
-        // ▶ FALLBACK : si 0 résultat, essaie avec le premier mot significatif
-        //   Ex: "Inter Miami CF" → "Miami", "Bayer Leverkusen" → "Leverkusen"
+      // ▶ FILTRE ANTI-PARASITES : retire les équipes féminines, jeunes, B, réserves
+      //   Ces équipes ont souvent des noms quasi-identiques aux équipes pro mais sans pertinence.
+      const isParasiteTeam = (name) => {
+        const n = (name || '').toLowerCase();
+        return /\b(w|women|wom|f[ée]minin|fem)\b/i.test(n) ||  // équipes féminines
+               /\bu(15|16|17|18|19|20|21|22|23)\b/i.test(n) || // jeunes
+               /\b(youth|junior|primavera|reserva|reserve|sub)\b/i.test(n) ||
+               /\b[bB]$/.test(n) || // équipes B (Real Madrid B, etc.)
+               /\bii$/i.test(n);    // équipes II
+      };
+
+      // Filtre les résultats parasites en premier, garde les pro
+      const arrFiltered = arr.filter(entry => {
+        const teamData = entry.team || entry;
+        return !isParasiteTeam(teamData.name);
+      });
+
+      // Si tout est parasite (rare), on prend la liste originale
+      const finalList = arrFiltered.length > 0 ? arrFiltered : arr;
+
+      if (finalList.length === 0) {
+        // Fallback : essaie avec le dernier mot distinctif
         const words = teamName.split(/\s+/).filter(w => w.length >= 4 && !/^(fc|sc|cf|sk|sv|ac|as|le|la|de|du|of)$/i.test(w));
         if (words.length > 0) {
-          const fallback = words[words.length - 1]; // dernier mot souvent le plus distinctif
+          const fallback = words[words.length - 1];
           if (fallback.length >= 3 && fallback !== search) {
             try {
               const fallbackBody = await apiSports(api, '/teams', { search: fallback });
               const fallbackArr = Array.isArray(fallbackBody?.response) ? fallbackBody.response : [];
-              if (fallbackArr.length > 0) {
-                arr.push(...fallbackArr);
+              const fallbackClean = fallbackArr.filter(entry => !isParasiteTeam((entry.team || entry).name));
+              if (fallbackClean.length > 0) {
+                finalList.push(...fallbackClean);
               }
             } catch (e) { /* ignore */ }
           }
         }
       }
 
-      if (arr.length === 0) {
+      if (finalList.length === 0) {
         errors.push({ source: api, message: `API-Sports : 0 équipe trouvée pour "${teamName}"` });
         return null;
       }
 
-      // Trouve la meilleure correspondance par similarité de nom
+      // Meilleure correspondance par similarité de nom
       let best = null;
       let bestSim = 0;
-      for (const entry of arr) {
+      for (const entry of finalList) {
         const teamData = entry.team || entry;
         const apiName = teamData.name || '';
         const sim = similarity(teamName, apiName);
@@ -1085,9 +1102,15 @@ async function searchTeamByName(api, teamName, errors) {
           best = { id: teamData.id, name: apiName, similarity: sim };
         }
       }
-      // ▶ Seuil abaissé à 0.55 (Inter Miami CF ≈ Inter Miami sim ~0.75 OK)
-      //   En dessous de 0.55, c'est vraiment douteux
-      if (best && best.similarity >= 0.55) return best;
+
+      if (best && best.similarity >= 0.55) {
+        errors.push({
+          source: 'paridex',
+          message: `[v12] Équipe "${teamName}" → ID ${best.id} ("${best.name}") sim=${best.similarity.toFixed(2)}`,
+        });
+        return best;
+      }
+
       errors.push({
         source: api,
         message: `Équipe "${teamName}" : meilleur match "${best?.name}" avec similarité ${best?.similarity?.toFixed(2)} (rejeté car < 0.55)`,
