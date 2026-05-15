@@ -659,32 +659,32 @@ function uniqGames(games, api) {
   return out;
 }
 
+// ▶ VERSION marker : change ce numéro à chaque modif importante pour invalider tous les caches
+const CODE_VERSION = 'v10-2026-05-15';
+
 async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
   const path = api === 'football' ? '/fixtures' : '/games';
   const currentYear = new Date().getUTCFullYear();
-  // ▶ FIX : pour les calendriers européens en mai, la saison en cours est N-1
-  //   On essaie les 2 saisons pour couvrir tous les championnats.
+  // Foot : on essaie saison N puis N-1 (couvre Europe + Sud-Amérique + MLS)
   const seasonsToTry = api === 'football' ? [currentYear, currentYear - 1] : [currentYear];
-  const league = context.leagueId;
-  const key = `${api}:recent:${teamId}:multi:${league || 'all'}`;
+  // ▶ Cache key inclut la version pour invalider quand le code change
+  const key = `${CODE_VERSION}:${api}:recent:${teamId}:multi`;
 
   return cached(key, 3 * 60 * 60 * 1000, async () => {
     let collected = [];
-    let totalRawResponses = 0;
-    const requestErrors = [];
+    let totalRaw = 0;
+    let totalFinished = 0;
+    const attemptResults = [];
 
-    // ▶ Stratégie cascade pour le foot : season+team (le plus fiable) → puis last seul
     const attempts = api === 'football'
       ? [
-          // Tente d'abord avec season (le plus fiable selon doc API-Football)
           ...seasonsToTry.map(season => ({ team: teamId, season })),
-          // Fallback sans season
-          { team: teamId, last: 15 },
+          { team: teamId, last: 20 },
         ]
       : [
           { team: teamId, season: currentYear },
-          { team: teamId, last: 15 },
+          { team: teamId, last: 20 },
         ];
 
     for (const rawParams of attempts) {
@@ -692,42 +692,41 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
       try {
         const body = await apiSports(api, path, params);
         const arr = Array.isArray(body?.response) ? body.response : [];
-        totalRawResponses += arr.length;
+        totalRaw += arr.length;
         collected = collected.concat(arr);
         const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
-        // ▶ ÉCONOMIE QUOTA : on s'arrête dès qu'on a 1 match terminé (suffit pour partial)
-        if (finished.length >= 1) return finished;
-        // ▶ Et aussi si l'API a renvoyé des matchs (même non terminés), on s'arrête
-        //   pour ne pas griller du quota inutile (saison en cours = beaucoup de NS)
-        if (arr.length >= 5) {
-          await sleep(150);
-          break;
+        totalFinished = finished.length;
+        attemptResults.push({ params, rawCount: arr.length, finishedCount: finished.length });
+
+        // On s'arrête dès qu'on a 3 matchs terminés (suffisant pour summarizeForm)
+        if (finished.length >= 3) {
+          errors.push({
+            source: 'paridex',
+            message: `[v10] fetchRecentGames team=${teamId} OK avec params=${JSON.stringify(params)} : ${finished.length} matchs terminés`,
+          });
+          return finished;
         }
       } catch (err) {
-        requestErrors.push(`${JSON.stringify(params)} → ${err.message}`);
+        attemptResults.push({ params, error: err.message });
         if (err.message && err.message.includes('Quota API-Sports épuisé')) {
           throw err;
         }
         if (err.message && (err.message.includes('429') || err.message.toLowerCase().includes('too many'))) {
-          await sleep(1100);
+          await sleep(1200);
         }
       }
-      await sleep(150);
+      await sleep(180);
     }
 
     const finished = uniqGames(collected, api).filter(g => isFinishedGame(g, api));
-    if (finished.length) return finished;
 
-    const statusesSample = collected.slice(0, 3).map(g => statusShort(g, api) || 'unknown').join(', ');
+    // ▶ Log DÉTAILLÉ avec ce qui s'est vraiment passé (pour qu'on voie tout)
     errors.push({
-      source: api,
-      endpoint: path,
-      team: teamId,
-      seasonsTried: seasonsToTry,
-      message: `[v8.2] Forme indisponible. API a renvoyé ${totalRawResponses} matchs bruts, 0 terminés (status: ${statusesSample || 'aucun'}).`,
-      debug: requestErrors.slice(0, 3),
+      source: 'paridex',
+      message: `[v10] fetchRecentGames team=${teamId} terminé : ${totalRaw} bruts, ${finished.length} terminés. Attempts: ${JSON.stringify(attemptResults)}`,
     });
-    return [];
+
+    return finished;
   });
 }
 
@@ -1020,7 +1019,7 @@ function adviceText(selection, match, homeStats, awayStats, prediction) {
 //   Plus fiable car indépendant des dates et saisons.
 async function searchTeamByName(api, teamName, errors) {
   if (!teamName) return null;
-  const key = `${api}:teamSearch:${teamName.toLowerCase()}`;
+  const key = `${CODE_VERSION}:${api}:teamSearch:${teamName.toLowerCase()}`;
   return cached(key, 7 * 24 * 60 * 60 * 1000, async () => { // cache 7 jours
     try {
       // ▶ API-Football : /teams?search= (min 3 caractères, accepte le nom complet)
