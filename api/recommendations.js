@@ -663,13 +663,13 @@ function uniqGames(games, api) {
 }
 
 // ▶ VERSION marker : change ce numéro à chaque modif importante pour invalider tous les caches
-const CODE_VERSION = 'v11-2026-05-15';
+const CODE_VERSION = 'v12-pro';
 
-// ▶ Rate limiter strict pour API-Football Free (10 req/min = 1 req / 7s)
-//   On garde un timestamp de la dernière requête API-Sports pour respecter ce seuil
+// ▶ Rate limiter modéré : plan Pro = 450 req/min = 1 req toutes les 130ms
+//   On garde 150ms par sécurité.
 let lastApiSportsCall = 0;
 async function apiSportsRateLimit() {
-  const MIN_INTERVAL_MS = 7000; // 7 secondes entre 2 requêtes (sécurité vs 6s théoriques)
+  const MIN_INTERVAL_MS = 150; // Pro : 450 req/min, donc 150ms suffit largement
   const elapsed = Date.now() - lastApiSportsCall;
   if (elapsed < MIN_INTERVAL_MS) {
     await sleep(MIN_INTERVAL_MS - elapsed);
@@ -681,12 +681,8 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
   const path = api === 'football' ? '/fixtures' : '/games';
   const currentYear = new Date().getUTCFullYear();
-  // ▶ IMPORTANT : Plan FREE API-Football limité aux saisons 2021-2023 uniquement.
-  //   En 2026 sur plan Free, seules les données 2023 sont accessibles.
-  //   On essaie d'abord saison actuelle (Pro), puis 2023 en dernier recours (Free).
-  const seasonsToTry = api === 'football'
-    ? (context.demoMode ? [2023] : [currentYear, currentYear - 1, 2023])
-    : [currentYear];
+  // ▶ Plan Pro : toutes les saisons accessibles → essaie N puis N-1
+  const seasonsToTry = api === 'football' ? [currentYear, currentYear - 1] : [currentYear];
   // ▶ Cache key inclut la version pour invalider quand le code change
   const key = `${CODE_VERSION}:${api}:recent:${teamId}:multi`;
 
@@ -1140,17 +1136,16 @@ async function enrichSelections(selections, opts, errors) {
 
   errors.push({ source: 'paridex', message: `[v8.1] byEvent après dédoublonnage: ${byEvent.length} matchs uniques` });
 
-  // ▶ ÉCONOMIE QUOTA + RATE LIMIT : on limite le nombre de matchs à enrichir
-  //   API-Football Free = 10 req/min strict. Chaque match coûte ~4 req = 28s.
-  //   Vercel timeout = 60s → maximum 2 matchs enrichis par appel sur plan Free.
+  // ▶ Plan PRO : 7500 req/jour + 450 req/min → on peut enrichir confortablement
+  //   Chaque match = ~4 requêtes × 150ms = 600ms par match
+  //   Vercel timeout 60s → ~100 matchs théoriquement, on cap à 30 par sécurité
   const reqPerMatch = 4;
-  const safetyBuffer = 5;
+  const safetyBuffer = 50;
   const maxAffordable = apiSportsQuota.remaining !== null
     ? Math.max(0, Math.floor((apiSportsQuota.remaining - safetyBuffer) / reqPerMatch))
     : byEvent.length;
 
-  // ▶ Plafond Vercel timeout : 2 matchs max pour rester sous 60s sur Free
-  const VERCEL_MAX_MATCHES = 2;
+  const VERCEL_MAX_MATCHES = 30;
   const eventsToEnrich = byEvent.slice(0, Math.min(byEvent.length, maxAffordable, maxApiEvents, VERCEL_MAX_MATCHES));
 
   errors.push({
@@ -1178,12 +1173,9 @@ async function enrichSelections(selections, opts, errors) {
     }
 
     try {
-      errors.push({ source: 'paridex', message: `[v8.2] Tentative enrichissement: ${seed.homeTeam} vs ${seed.awayTeam} (${api})` });
-      // ▶ ÉTAPE 1 : Trouver les IDs des 2 équipes par recherche de nom
-      //   PAUSES de 200ms entre requêtes pour respecter rate limit Free (10 req/min)
-      await sleep(200);
+      errors.push({ source: 'paridex', message: `[v12] Enrichissement: ${seed.homeTeam} vs ${seed.awayTeam} (${api})` });
+      // ▶ Le rate limiter dans apiSports() gère déjà les pauses (150ms entre requêtes)
       const homeTeam = await searchTeamByName(api, seed.homeTeam, errors);
-      await sleep(200);
       const awayTeam = await searchTeamByName(api, seed.awayTeam, errors);
 
       if (!homeTeam && !awayTeam) {
@@ -1195,27 +1187,24 @@ async function enrichSelections(selections, opts, errors) {
         continue;
       }
 
-      // ▶ ÉTAPE 2 : Récupérer la forme (last=10) pour chaque équipe — pas de saison nécessaire
-      await sleep(250);
+      // ▶ ÉTAPE 2 : Récupérer la forme (15 derniers matchs) pour chaque équipe
       const homeRecent = homeTeam ? await fetchRecentGames(api, homeTeam.id, errors, { fixtureId: null, seed }) : [];
-      await sleep(250);
       const awayRecent = awayTeam ? await fetchRecentGames(api, awayTeam.id, errors, { fixtureId: null, seed }) : [];
 
       const homeStats = homeTeam ? summarizeForm(homeRecent, homeTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
       const awayStats = awayTeam ? summarizeForm(awayRecent, awayTeam.id, api) : { form: [], W: 0, D: 0, L: 0, played: 0, label: 'n/d' };
 
-      // ▶ ÉTAPE 3 : Predictions (uniquement si quota OK : ça coûte 2 requêtes en plus par match)
+      // ▶ ÉTAPE 3 : Predictions (toujours activé sur Pro)
       let prediction = null;
       let fixtureId = null;
-      const quotaOkForPredictions = apiSportsQuota.remaining === null || apiSportsQuota.remaining > 20;
-      if (api === 'football' && homeTeam && quotaOkForPredictions) {
+      if (api === 'football' && homeTeam && awayTeam) {
         try {
-          await sleep(250);
+          await sleep(150);
           const nextBody = await apiSports(api, '/fixtures', { team: homeTeam.id, next: 5 });
           const upcoming = Array.isArray(nextBody?.response) ? nextBody.response : [];
           const targetMatch = upcoming.find(g => {
             const t = getTeams(g, api);
-            return awayTeam && String(t.away.id) === String(awayTeam.id);
+            return String(t.away.id) === String(awayTeam.id);
           });
           if (targetMatch) {
             fixtureId = getGameId(targetMatch);
