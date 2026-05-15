@@ -681,8 +681,12 @@ async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
   const path = api === 'football' ? '/fixtures' : '/games';
   const currentYear = new Date().getUTCFullYear();
-  // Foot : on essaie saison N puis N-1 (couvre Europe + Sud-Amérique + MLS)
-  const seasonsToTry = api === 'football' ? [currentYear, currentYear - 1] : [currentYear];
+  // ▶ IMPORTANT : Plan FREE API-Football limité aux saisons 2021-2023 uniquement.
+  //   En 2026 sur plan Free, seules les données 2023 sont accessibles.
+  //   On essaie d'abord saison actuelle (Pro), puis 2023 en dernier recours (Free).
+  const seasonsToTry = api === 'football'
+    ? (context.demoMode ? [2023] : [currentYear, currentYear - 1, 2023])
+    : [currentYear];
   // ▶ Cache key inclut la version pour invalider quand le code change
   const key = `${CODE_VERSION}:${api}:recent:${teamId}:multi`;
 
