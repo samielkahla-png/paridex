@@ -288,6 +288,9 @@ async function apiSports(api, path, params = {}) {
     throw new Error(`Quota API-Sports épuisé (reste ${apiSportsQuota.remaining}). Enrichissement stoppé.`);
   }
 
+  // ▶ Rate-limit strict 10 req/min (impératif sur le plan Free)
+  await apiSportsRateLimit();
+
   const url = new URL(base + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
@@ -660,7 +663,19 @@ function uniqGames(games, api) {
 }
 
 // ▶ VERSION marker : change ce numéro à chaque modif importante pour invalider tous les caches
-const CODE_VERSION = 'v10-2026-05-15';
+const CODE_VERSION = 'v11-2026-05-15';
+
+// ▶ Rate limiter strict pour API-Football Free (10 req/min = 1 req / 7s)
+//   On garde un timestamp de la dernière requête API-Sports pour respecter ce seuil
+let lastApiSportsCall = 0;
+async function apiSportsRateLimit() {
+  const MIN_INTERVAL_MS = 7000; // 7 secondes entre 2 requêtes (sécurité vs 6s théoriques)
+  const elapsed = Date.now() - lastApiSportsCall;
+  if (elapsed < MIN_INTERVAL_MS) {
+    await sleep(MIN_INTERVAL_MS - elapsed);
+  }
+  lastApiSportsCall = Date.now();
+}
 
 async function fetchRecentGames(api, teamId, errors, context = {}) {
   if (!teamId) return [];
@@ -1121,16 +1136,18 @@ async function enrichSelections(selections, opts, errors) {
 
   errors.push({ source: 'paridex', message: `[v8.1] byEvent après dédoublonnage: ${byEvent.length} matchs uniques` });
 
-  // ▶ ÉCONOMIE QUOTA : on limite le nombre de matchs à enrichir en fonction du quota restant
-  //   Chaque match consomme ~3-5 requêtes.
+  // ▶ ÉCONOMIE QUOTA + RATE LIMIT : on limite le nombre de matchs à enrichir
+  //   API-Football Free = 10 req/min strict. Chaque match coûte ~4 req = 28s.
+  //   Vercel timeout = 60s → maximum 2 matchs enrichis par appel sur plan Free.
   const reqPerMatch = 4;
   const safetyBuffer = 5;
-  // On laisse plus de matchs si quota inconnu (1ère requête le révèlera)
   const maxAffordable = apiSportsQuota.remaining !== null
     ? Math.max(0, Math.floor((apiSportsQuota.remaining - safetyBuffer) / reqPerMatch))
     : byEvent.length;
 
-  const eventsToEnrich = byEvent.slice(0, Math.min(byEvent.length, maxAffordable, maxApiEvents));
+  // ▶ Plafond Vercel timeout : 2 matchs max pour rester sous 60s sur Free
+  const VERCEL_MAX_MATCHES = 2;
+  const eventsToEnrich = byEvent.slice(0, Math.min(byEvent.length, maxAffordable, maxApiEvents, VERCEL_MAX_MATCHES));
 
   errors.push({
     source: 'paridex',
